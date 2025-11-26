@@ -311,12 +311,15 @@ func (at *AuthTester) testMongoDB(host string, port int) (bool, error) {
 	return false, nil // Conservative for now
 }
 
-// testHTTPBasic tests HTTP Basic Auth
+// testHTTPBasic tests HTTP Basic Auth - first checks if auth is required
 func (at *AuthTester) testHTTPBasic(host string, port int, cred Credential) (bool, error) {
 	client := &http.Client{
 		Timeout: at.Timeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
 
@@ -326,6 +329,31 @@ func (at *AuthTester) testHTTPBasic(host string, port int, cred Credential) (boo
 	}
 
 	url := fmt.Sprintf("%s://%s:%d/", scheme, host, port)
+
+	// Step 1: Check if auth is even required (without credentials)
+	reqNoAuth, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, err
+	}
+	reqNoAuth.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
+
+	respNoAuth, err := client.Do(reqNoAuth)
+	if err != nil {
+		return false, err
+	}
+	respNoAuth.Body.Close()
+
+	// If we get 200 without auth, the site doesn't require auth - not a vuln we can test
+	if respNoAuth.StatusCode == 200 {
+		return false, nil
+	}
+
+	// If we don't get 401 or 403, auth isn't required in the traditional sense
+	if respNoAuth.StatusCode != 401 && respNoAuth.StatusCode != 403 {
+		return false, nil
+	}
+
+	// Step 2: Auth IS required - now try the credentials
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return false, err
@@ -334,6 +362,7 @@ func (at *AuthTester) testHTTPBasic(host string, port int, cred Credential) (boo
 	// Add Basic Auth header
 	auth := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Password))
 	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -341,8 +370,8 @@ func (at *AuthTester) testHTTPBasic(host string, port int, cred Credential) (boo
 	}
 	defer resp.Body.Close()
 
-	// 200 or 301/302 with valid creds
-	if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 {
+	// If we now get 200 (was 401/403 before), creds work!
+	if resp.StatusCode == 200 {
 		return true, nil
 	}
 
