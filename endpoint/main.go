@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/timastras9/kali_tools/endpoint/pkg/auth"
@@ -14,15 +16,16 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "3.3.0"
+const version = "3.7.0"
 
-// Top 25 most common subdomains for brute forcing
+// Common subdomains for brute forcing
 var Top25Subdomains = []string{
 	"www", "mail", "api", "admin", "dev",
 	"staging", "test", "app", "portal", "secure",
 	"vpn", "remote", "login", "dashboard", "cdn",
 	"static", "assets", "blog", "shop", "support",
 	"docs", "help", "status", "auth", "token",
+	"security", // Added for nsicorp.org
 }
 
 func main() {
@@ -36,7 +39,14 @@ func main() {
 	delay := flag.Int("delay", 0, "Delay between requests in ms (0 = no delay)")
 	depth := flag.Int("depth", 3, "Crawl depth for endpoint discovery")
 	brute := flag.Bool("brute", false, "Enable DNS brute forcing with top 25 common subdomains")
+	apiMode := flag.Bool("api", false, "Start HTTP API server (for Cloud Run deployment)")
 	flag.Parse()
+
+	// If API mode, start the HTTP server and exit
+	if *apiMode {
+		StartAPIServer()
+		return
+	}
 
 	// Stealth mode overrides
 	if *stealth {
@@ -86,50 +96,89 @@ func main() {
 	phaseStart := time.Now()
 
 	discoveredSubdomains := make(map[string]bool)
+	var subMu sync.Mutex
 
-	// 1a: Certificate Transparency logs
+	// Run CT lookup and DNS lookups in parallel
+	var phase1Wg sync.WaitGroup
 	ctLookup := scanner.NewCTLookup(timeoutDuration)
-	ctSubs, err := ctLookup.FindSubdomains(domain)
-	if err == nil && len(ctSubs) > 0 {
-		fmt.Printf("   ✅ CT Logs: Found %d subdomains\n", len(ctSubs))
-		for _, sub := range ctSubs {
-			discoveredSubdomains[sub] = true
-		}
-	}
-
-	// 1b: DNS Records enumeration
 	dnsEnum := scanner.NewDNSEnumerator(timeoutDuration)
-	dnsSubs := dnsEnum.FindSubdomainsViaDNS(domain)
-	if len(dnsSubs) > 0 {
-		fmt.Printf("   ✅ DNS Records: Found %d subdomains\n", len(dnsSubs))
-		for _, sub := range dnsSubs {
-			discoveredSubdomains[sub] = true
-		}
-	}
 
-	// Show MX records (mail servers)
-	mxRecords := dnsEnum.GetMXRecords(domain)
+	// 1a: Certificate Transparency logs (parallel)
+	phase1Wg.Add(1)
+	go func() {
+		defer phase1Wg.Done()
+		ctSubs, err := ctLookup.FindSubdomains(domain)
+		if err == nil && len(ctSubs) > 0 {
+			fmt.Printf("   ✅ CT Logs: Found %d subdomains\n", len(ctSubs))
+			subMu.Lock()
+			for _, sub := range ctSubs {
+				discoveredSubdomains[sub] = true
+			}
+			subMu.Unlock()
+		}
+	}()
+
+	// 1b: DNS Records enumeration (parallel)
+	phase1Wg.Add(1)
+	go func() {
+		defer phase1Wg.Done()
+		dnsSubs := dnsEnum.FindSubdomainsViaDNS(domain)
+		if len(dnsSubs) > 0 {
+			fmt.Printf("   ✅ DNS Records: Found %d subdomains\n", len(dnsSubs))
+			subMu.Lock()
+			for _, sub := range dnsSubs {
+				discoveredSubdomains[sub] = true
+			}
+			subMu.Unlock()
+		}
+	}()
+
+	// DNS record lookups in parallel
+	var mxRecords []*net.MX
+	var nsRecords, txtRecords, aRecords []string
+
+	phase1Wg.Add(4)
+	go func() {
+		defer phase1Wg.Done()
+		mxRecords = dnsEnum.GetMXRecords(domain)
+	}()
+	go func() {
+		defer phase1Wg.Done()
+		nsRecords = dnsEnum.GetNSRecords(domain)
+	}()
+	go func() {
+		defer phase1Wg.Done()
+		txtRecords = dnsEnum.GetTXTRecords(domain)
+	}()
+	go func() {
+		defer phase1Wg.Done()
+		aRecords = dnsEnum.GetARecords(domain)
+	}()
+
+	phase1Wg.Wait()
+
+	// Display results (after parallel lookups complete)
 	if len(mxRecords) > 0 {
 		fmt.Println("   📧 MX Records (mail servers):")
 		for _, mx := range mxRecords {
 			fmt.Printf("      %s (priority %d)\n", mx.Host, mx.Pref)
+			scanReport.DNSRecords.MXRecords = append(scanReport.DNSRecords.MXRecords,
+				fmt.Sprintf("%s (priority %d)", strings.TrimSuffix(mx.Host, "."), mx.Pref))
 		}
 	}
 
-	// Show NS records (nameservers)
-	nsRecords := dnsEnum.GetNSRecords(domain)
 	if len(nsRecords) > 0 {
 		fmt.Println("   🌐 NS Records (nameservers):")
 		for _, ns := range nsRecords {
 			fmt.Printf("      %s\n", ns)
+			scanReport.DNSRecords.NSRecords = append(scanReport.DNSRecords.NSRecords, ns)
 		}
 	}
 
-	// Show TXT records (SPF, DKIM, etc.)
-	txtRecords := dnsEnum.GetTXTRecords(domain)
 	if len(txtRecords) > 0 {
 		fmt.Println("   📝 TXT Records:")
 		for _, txt := range txtRecords {
+			scanReport.DNSRecords.TXTRecords = append(scanReport.DNSRecords.TXTRecords, txt)
 			if len(txt) > 60 {
 				fmt.Printf("      %s...\n", txt[:60])
 			} else {
@@ -138,12 +187,33 @@ func main() {
 		}
 	}
 
-	// Show A/AAAA records
-	aRecords := dnsEnum.GetARecords(domain)
 	if len(aRecords) > 0 {
 		fmt.Println("   🔢 A/AAAA Records:")
 		for _, ip := range aRecords {
 			fmt.Printf("      %s\n", ip)
+			scanReport.DNSRecords.ARecords = append(scanReport.DNSRecords.ARecords, ip)
+		}
+
+		// Geolocate IPs (async, IPv4 only)
+		fmt.Println("   📍 Geolocating IPs...")
+		ipv4s := []string{}
+		for _, ip := range aRecords {
+			if !strings.Contains(ip, ":") { // Skip IPv6
+				ipv4s = append(ipv4s, ip)
+			}
+		}
+		if len(ipv4s) > 0 {
+			geoResults := scanner.GeolocateIPs(ipv4s)
+			for ip, geo := range geoResults {
+				fmt.Printf("      %s → %s, %s (%s)\n", ip, geo.City, geo.Country, geo.ISP)
+				scanReport.GeoLocations = append(scanReport.GeoLocations, report.GeoInfo{
+					IP:      ip,
+					Country: geo.Country,
+					City:    geo.City,
+					ISP:     geo.ISP,
+					Org:     geo.Org,
+				})
+			}
 		}
 	}
 
@@ -239,41 +309,103 @@ func main() {
 		}
 	}
 
-	allEndpoints := make(map[string]scanner.CrawlResult)
+	// Track endpoints by path to deduplicate across hosts
+	// Key: path (e.g., "/api/contact"), Value: list of full URLs with that path
+	pathToURLs := make(map[string][]scanner.CrawlResult)
+	var pathMu sync.Mutex
+
+	// Crawl all hosts in parallel (each with its own crawler instance)
+	var crawlWg sync.WaitGroup
+	hostSem := make(chan struct{}, 5) // Limit concurrent host crawls
+
 	for _, host := range liveHosts {
-		baseURL := fmt.Sprintf("https://%s", host)
-		results := crawler.Crawl(baseURL)
-		for _, r := range results {
-			if r.StatusCode == 200 {
-				allEndpoints[r.URL] = r
-			}
-		}
+		crawlWg.Add(1)
+		go func(h string) {
+			defer crawlWg.Done()
+			hostSem <- struct{}{}        // Acquire semaphore
+			defer func() { <-hostSem }() // Release semaphore
 
-		// Also try HTTP if HTTPS failed
-		baseURL = fmt.Sprintf("http://%s", host)
-		results = crawler.Crawl(baseURL)
-		for _, r := range results {
-			if r.StatusCode == 200 {
-				allEndpoints[r.URL] = r
+			// Create a new crawler for this host to avoid race conditions
+			hostCrawler := scanner.NewCrawler(*workers, timeoutDuration)
+			hostCrawler.MaxDepth = *depth
+			hostCrawler.RateLimit = time.Duration(*delay) * time.Millisecond
+			hostCrawler.OnResult = crawler.OnResult
+
+			// Try HTTPS first
+			baseURL := fmt.Sprintf("https://%s", h)
+			results := hostCrawler.Crawl(baseURL)
+			for _, r := range results {
+				if r.StatusCode == 200 {
+					path := extractPath(r.URL)
+					pathMu.Lock()
+					pathToURLs[path] = append(pathToURLs[path], r)
+					pathMu.Unlock()
+				}
 			}
-		}
+
+			// Also try HTTP
+			baseURL = fmt.Sprintf("http://%s", h)
+			results = hostCrawler.Crawl(baseURL)
+			for _, r := range results {
+				if r.StatusCode == 200 {
+					path := extractPath(r.URL)
+					pathMu.Lock()
+					pathToURLs[path] = append(pathToURLs[path], r)
+					pathMu.Unlock()
+				}
+			}
+		}(host)
 	}
+	crawlWg.Wait()
 
-	// Convert to report format
-	for _, r := range allEndpoints {
+	// Deduplicate: prefer www. version, note mirrors
+	mirroredHosts := make(map[string]bool)
+	for path, urls := range pathToURLs {
+		if len(urls) == 0 {
+			continue
+		}
+
+		// Find canonical URL (prefer www.)
+		canonical := urls[0]
+		for _, u := range urls {
+			if strings.Contains(u.URL, "www.") {
+				canonical = u
+				break
+			}
+		}
+
+		// Track mirrored hosts
+		for _, u := range urls {
+			host := extractHost(u.URL)
+			canonicalHost := extractHost(canonical.URL)
+			if host != canonicalHost {
+				mirroredHosts[host] = true
+			}
+		}
+
 		scanReport.Paths = append(scanReport.Paths, report.PathEntry{
-			URL:        r.URL,
-			Path:       r.URL,
-			StatusCode: r.StatusCode,
+			URL:        canonical.URL,
+			Path:       path,
+			StatusCode: canonical.StatusCode,
 			Risk:       "INFO",
-			Category:   r.Type,
+			Category:   canonical.Type,
 		})
 	}
 
-	fmt.Printf("   Found %d unique endpoints (%.1fs)\n", len(allEndpoints), time.Since(phaseStart).Seconds())
+	// Show mirrored hosts note
+	if len(mirroredHosts) > 0 {
+		mirrors := []string{}
+		for h := range mirroredHosts {
+			mirrors = append(mirrors, h)
+		}
+		fmt.Printf("   ℹ️  Note: %s mirrors the same content\n", strings.Join(mirrors, ", "))
+	}
+
+	fmt.Printf("   Found %d unique endpoints (%.1fs)\n", len(pathToURLs), time.Since(phaseStart).Seconds())
 
 	// Check for new subdomains discovered during crawling
-	if len(scanner.DiscoveredSubdomains) > 0 {
+	discoveredSubs := scanner.GetDiscoveredSubdomains()
+	if len(discoveredSubs) > 0 {
 		fmt.Printf("\n🔍 Phase 2b: Verifying subdomains found in content...\n")
 
 		// Track what we already have
@@ -285,7 +417,7 @@ func main() {
 		newSubsToCheck := []string{}
 		checkedPrefixes := make(map[string]bool)
 
-		for sub := range scanner.DiscoveredSubdomains {
+		for sub := range discoveredSubs {
 			// Skip if we already have this exact subdomain
 			if existingHosts[sub] {
 				continue
@@ -315,19 +447,29 @@ func main() {
 						Scheme:     r.Scheme,
 					})
 
-					// Crawl the new subdomain too
+					// Crawl the new subdomain too (but deduplicate by path)
 					baseURL := fmt.Sprintf("https://%s", r.Subdomain)
 					results := crawler.Crawl(baseURL)
 					for _, cr := range results {
-						if cr.StatusCode == 200 && allEndpoints[cr.URL].URL == "" {
-							allEndpoints[cr.URL] = cr
-							scanReport.Paths = append(scanReport.Paths, report.PathEntry{
-								URL:        cr.URL,
-								Path:       cr.URL,
-								StatusCode: cr.StatusCode,
-								Risk:       "INFO",
-								Category:   cr.Type,
-							})
+						if cr.StatusCode == 200 {
+							path := extractPath(cr.URL)
+							// Only add if we don't already have this path
+							found := false
+							for _, existing := range scanReport.Paths {
+								if existing.Path == path {
+									found = true
+									break
+								}
+							}
+							if !found {
+								scanReport.Paths = append(scanReport.Paths, report.PathEntry{
+									URL:        cr.URL,
+									Path:       path,
+									StatusCode: cr.StatusCode,
+									Risk:       "INFO",
+									Category:   cr.Type,
+								})
+							}
 						}
 					}
 				}
@@ -376,12 +518,38 @@ func main() {
 		}
 	}
 
-	// Filter out Cloudflare-proxied ports
+	// Determine which ports to scan vs mark as Cloudflare
 	ports := scanner.Top100Ports
 	portsToScan := ports
-	if len(proxiedHosts) > 0 {
-		fmt.Printf("\n   ☁️  Cloudflare detected - skipping proxied ports (80, 443, 8080, 8443, 2052-2096)\n")
+	isCloudflareHost := len(proxiedHosts) > 0
+
+	if isCloudflareHost {
+		fmt.Printf("\n   ☁️  Cloudflare detected - marking proxied ports (80, 443, 8080, 8443, 2052-2096)\n")
 		portsToScan = filterCloudfarePorts(ports)
+
+		// Combine all Cloudflare hosts and show ports once
+		cfHosts := strings.Join(hostsToScan, ", ")
+		scanReport.CloudflareHosts = cfHosts
+		fmt.Printf("   ☁️  Hosts behind Cloudflare: %s\n", cfHosts)
+
+		// Get sorted list of Cloudflare ports
+		cfPorts := make([]int, 0, len(cloudflareProxiedPorts))
+		for port := range cloudflareProxiedPorts {
+			cfPorts = append(cfPorts, port)
+		}
+		sort.Ints(cfPorts)
+
+		// Add Cloudflare-proxied ports to report ONCE
+		for _, port := range cfPorts {
+			serviceName := getServiceName(port)
+			fmt.Printf("   ☁️  Port %d - %s (Cloudflare Proxy)\n", port, serviceName)
+			scanReport.Ports = append(scanReport.Ports, report.PortEntry{
+				Port:         port,
+				Service:      serviceName,
+				Risk:         "INFO",
+				IsCloudflare: true,
+			})
+		}
 	}
 
 	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d unique IPs, %d ports each)\n", len(hostsToScan), len(portsToScan))
@@ -417,7 +585,7 @@ func main() {
 	}
 
 	portScanner.ScanMultipleHosts(hostsToScan, portsToScan)
-	fmt.Printf("   Found %d open ports (%.1fs)\n", len(portScanner.Results), time.Since(phaseStart).Seconds())
+	fmt.Printf("   Found %d open ports (%.1fs)\n", len(portScanner.Results)+len(scanReport.Ports), time.Since(phaseStart).Seconds())
 
 	// ==========================================
 	// PHASE 4: Auth Testing
@@ -628,4 +796,56 @@ func printHeader(domain string, workers, depth int) {
 │  Crawl Depth: %-40d │
 ╰─────────────────────────────────────────────────────────╯
 `, version, domain, workers, depth)
+}
+
+// extractPath extracts the path portion from a URL (e.g., "/api/contact" from "https://example.com/api/contact")
+func extractPath(rawURL string) string {
+	// Find the start of the path after the host
+	idx := strings.Index(rawURL, "://")
+	if idx == -1 {
+		return rawURL
+	}
+	rest := rawURL[idx+3:] // Skip "://"
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx == -1 {
+		return "/" // Root path
+	}
+	return rest[slashIdx:]
+}
+
+// extractHost extracts the host from a URL (e.g., "www.example.com" from "https://www.example.com/path")
+func extractHost(rawURL string) string {
+	idx := strings.Index(rawURL, "://")
+	if idx == -1 {
+		return rawURL
+	}
+	rest := rawURL[idx+3:]
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx == -1 {
+		return rest
+	}
+	return rest[:slashIdx]
+}
+
+// getServiceName returns a human-readable service name for common ports
+func getServiceName(port int) string {
+	services := map[int]string{
+		80:   "HTTP",
+		443:  "HTTPS",
+		8080: "HTTP-Proxy",
+		8443: "HTTPS-Alt",
+		2052: "Cloudflare HTTP",
+		2053: "Cloudflare HTTPS",
+		2082: "cPanel HTTP",
+		2083: "cPanel HTTPS",
+		2086: "WHM HTTP",
+		2087: "WHM HTTPS",
+		2095: "Webmail HTTP",
+		2096: "Webmail HTTPS",
+		8880: "HTTP-Alt",
+	}
+	if name, ok := services[port]; ok {
+		return name
+	}
+	return "Unknown"
 }

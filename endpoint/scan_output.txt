@@ -1,0 +1,68 @@
+
+╭─────────────────────────────────────────────────────────╮
+│  ENDPOINT SCANNER v3.3.0                                │
+│  Target: nsicorp.org                                   │
+│  Mode: Dynamic Discovery                                │
+│  Workers: 50                                           │
+│  Crawl Depth: 3                                        │
+╰─────────────────────────────────────────────────────────╯
+
+🔍 Phase 1: Subdomain Discovery
+   Searching CT logs, DNS records (MX, NS, TXT, CNAME)...
+   ✅ CT Logs: Found 1 subdomains
+   📧 MX Records (mail servers):
+      route1.mx.cloudflare.net. (priority 41)
+      route3.mx.cloudflare.net. (priority 50)
+      route2.mx.cloudflare.net. (priority 91)
+   🌐 NS Records (nameservers):
+      fred.ns.cloudflare.com
+      irma.ns.cloudflare.com
+   📝 TXT Records:
+      v=spf1 include:_spf.mx.cloudflare.net ~all
+   🔢 A/AAAA Records:
+      2606:4700:3031::6815:70d
+      2606:4700:3035::ac43:9b5d
+      172.67.155.93
+      104.21.7.13
+   🔨 Brute forcing top 25 subdomains...
+   Verifying 26 potential subdomains...
+   ✅ LIVE: www.nsicorp.org (2606:4700:3031::6815:70d)
+   ✅ LIVE: token.nsicorp.org (2606:4700:3031::6815:70d)
+   ✅ LIVE: nsicorp.org (2606:4700:3031::6815:70d)
+   Found 3 live subdomains (24.3s)
+
+🕷️  Phase 2: Endpoint Discovery (Crawling)
+   Crawling sites, parsing HTML/JS, checking robots.txt & sitemap.xml...
+   ✅ [page] https://www.nsicorp.org
+   ✅ [style] https://www.nsicorp.org/assets/index-CsyrY_jk.css
+   ✅ [script] https://www.nsicorp.org/assets/index-Db9EFX3f.js
+   ✅ [api] https://www.nsicorp.org/api/contact
+   ✅ [page] https://nsicorp.org
+   ✅ [script] https://nsicorp.org/assets/index-Db9EFX3f.js
+   ✅ [style] https://nsicorp.org/assets/index-CsyrY_jk.css
+   ✅ [api] https://nsicorp.org/api/contact
+   Found 8 unique endpoints (40.0s)
+
+🔍 Phase 2b: Verifying subdomains found in content...
+   Found 1 new subdomain references, verifying...
+   ✅ NEW: security.nsicorp.org (2606:4700:3035::ac43:9b5d)
+
+   ℹ️  Skipping redundant hosts (same IP):
+      token.nsicorp.org → same as www.nsicorp.org (2606:4700:3031::6815:70d)
+      nsicorp.org → same as www.nsicorp.org (2606:4700:3031::6815:70d)
+
+   ☁️  Cloudflare detected - skipping proxied ports (80, 443, 8080, 8443, 2052-2096)
+
+🔌 Phase 3: Port Scanning (2 unique IPs, 96 ports each)
+   Found 0 open ports (20.0s)
+
+✅ Scan Complete!
+   Duration: 1m29s
+   Total Findings: 12
+   Live Subdomains: 4
+   Endpoints: 8
+   Open Ports: 0
+   Auth Tests: 0
+
+📄 Report saved to: report_nsicorp.org_20251125_203638.html
+🌐 Opening report in browser...

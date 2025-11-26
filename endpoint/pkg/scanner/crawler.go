@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,22 +80,53 @@ func (c *Crawler) Crawl(baseURL string) []CrawlResult {
 		c.checkSitemap(baseURL, queue)
 	}()
 
+	// Track active workers
+	var activeWorkers int32
+	done := make(chan struct{})
+
 	// Start workers
 	for i := 0; i < c.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for targetURL := range queue {
-				if c.RateLimit > 0 {
-					time.Sleep(c.RateLimit)
+			for {
+				select {
+				case targetURL, ok := <-queue:
+					if !ok {
+						return
+					}
+					atomic.AddInt32(&activeWorkers, 1)
+					if c.RateLimit > 0 {
+						time.Sleep(c.RateLimit)
+					}
+					c.crawlPage(targetURL, queue)
+					atomic.AddInt32(&activeWorkers, -1)
+				case <-done:
+					return
 				}
-				c.crawlPage(targetURL, queue)
 			}
 		}()
 	}
 
-	// Wait a bit for initial crawl, then close queue
-	time.Sleep(5 * time.Second)
+	// Smart wait: check if queue is idle (no active workers and empty queue)
+	maxWait := 5 * time.Second
+	checkInterval := 200 * time.Millisecond
+	idleCount := 0
+	startWait := time.Now()
+
+	for time.Since(startWait) < maxWait {
+		time.Sleep(checkInterval)
+		if atomic.LoadInt32(&activeWorkers) == 0 && len(queue) == 0 {
+			idleCount++
+			if idleCount >= 3 { // Idle for 600ms
+				break
+			}
+		} else {
+			idleCount = 0
+		}
+	}
+
+	close(done)
 	close(queue)
 	wg.Wait()
 
@@ -166,9 +198,7 @@ func (c *Crawler) crawlPage(pageURL string, queue chan<- string) {
 	// Extract subdomain references from content
 	foundSubs := c.ExtractSubdomains(string(body), c.baseDomain)
 	for _, sub := range foundSubs {
-		c.mu.Lock()
-		DiscoveredSubdomains[sub] = true
-		c.mu.Unlock()
+		AddDiscoveredSubdomain(sub)
 	}
 
 	// Extract API endpoints from JavaScript
@@ -456,6 +486,25 @@ func (c *Crawler) ExtractSubdomains(body, baseDomain string) []string {
 
 // DiscoveredSubdomains holds subdomains found during crawling
 var DiscoveredSubdomains = make(map[string]bool)
+var discoveredSubMu sync.Mutex
+
+// AddDiscoveredSubdomain safely adds a subdomain to the discovered list
+func AddDiscoveredSubdomain(sub string) {
+	discoveredSubMu.Lock()
+	DiscoveredSubdomains[sub] = true
+	discoveredSubMu.Unlock()
+}
+
+// GetDiscoveredSubdomains returns a copy of discovered subdomains
+func GetDiscoveredSubdomains() map[string]bool {
+	discoveredSubMu.Lock()
+	defer discoveredSubMu.Unlock()
+	copy := make(map[string]bool)
+	for k, v := range DiscoveredSubdomains {
+		copy[k] = v
+	}
+	return copy
+}
 
 // classifyURL determines the type of endpoint
 func (c *Crawler) classifyURL(rawURL, contentType string) string {

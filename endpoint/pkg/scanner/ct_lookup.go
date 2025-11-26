@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -287,4 +288,64 @@ func (de *DNSEnumerator) GetARecords(domain string) []string {
 		return nil
 	}
 	return ips
+}
+
+// GeoLocation holds IP geolocation data
+type GeoLocation struct {
+	IP          string  `json:"query"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"countryCode"`
+	Region      string  `json:"regionName"`
+	City        string  `json:"city"`
+	ISP         string  `json:"isp"`
+	Org         string  `json:"org"`
+	Lat         float64 `json:"lat"`
+	Lon         float64 `json:"lon"`
+}
+
+// GeolocateIP looks up geographic location for an IP address
+func GeolocateIP(ip string) (*GeoLocation, error) {
+	// Skip IPv6 for now (ip-api.com supports it but results vary)
+	if strings.Contains(ip, ":") {
+		return nil, fmt.Errorf("IPv6 not supported")
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := fmt.Sprintf("http://ip-api.com/json/%s", ip)
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var geo GeoLocation
+	if err := json.NewDecoder(resp.Body).Decode(&geo); err != nil {
+		return nil, err
+	}
+
+	return &geo, nil
+}
+
+// GeolocateIPs looks up multiple IPs in parallel
+func GeolocateIPs(ips []string) map[string]*GeoLocation {
+	results := make(map[string]*GeoLocation)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, ip := range ips {
+		wg.Add(1)
+		go func(ipAddr string) {
+			defer wg.Done()
+			geo, err := GeolocateIP(ipAddr)
+			if err == nil && geo != nil {
+				mu.Lock()
+				results[ipAddr] = geo
+				mu.Unlock()
+			}
+		}(ip)
+	}
+
+	wg.Wait()
+	return results
 }

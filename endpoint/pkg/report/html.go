@@ -7,21 +7,42 @@ import (
 	"os/exec"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 )
 
 // ScanReport holds all scan results
 type ScanReport struct {
-	Target      string
-	Mode        string
-	StartTime   time.Time
-	EndTime     time.Time
-	Duration    time.Duration
-	Subdomains  []SubdomainEntry
-	Paths       []PathEntry
-	Ports       []PortEntry
-	AuthResults []AuthEntry
-	Summary     ReportSummary
+	Target          string
+	Mode            string
+	StartTime       time.Time
+	EndTime         time.Time
+	Duration        time.Duration
+	Subdomains      []SubdomainEntry
+	Paths           []PathEntry
+	Ports           []PortEntry
+	AuthResults     []AuthEntry
+	DNSRecords      DNSInfo
+	GeoLocations    []GeoInfo
+	Summary         ReportSummary
+	CloudflareHosts string // Comma-separated list of hosts behind Cloudflare
+}
+
+// DNSInfo holds DNS record information
+type DNSInfo struct {
+	MXRecords  []string
+	NSRecords  []string
+	TXTRecords []string
+	ARecords   []string
+}
+
+// GeoInfo holds IP geolocation data for the report
+type GeoInfo struct {
+	IP      string
+	Country string
+	City    string
+	ISP     string
+	Org     string
 }
 
 type SubdomainEntry struct {
@@ -44,14 +65,15 @@ type PathEntry struct {
 }
 
 type PortEntry struct {
-	Host    string
-	Port    int
-	Service string
-	Banner  string
-	Risk    string
-	OWASP   string // OWASP Top 10 mapping
-	CWE     string // CWE ID
-	NIST    string // NIST 800-53 control
+	Host        string
+	Port        int
+	Service     string
+	Banner      string
+	Risk        string
+	OWASP       string // OWASP Top 10 mapping
+	CWE         string // CWE ID
+	NIST        string // NIST 800-53 control
+	IsCloudflare bool  // True if this is a Cloudflare-proxied port
 }
 
 type AuthEntry struct {
@@ -267,6 +289,75 @@ const htmlTemplate = `<!DOCTYPE html>
             </div>
         </div>
 
+        {{if or .DNSRecords.MXRecords .DNSRecords.NSRecords .DNSRecords.TXTRecords .DNSRecords.ARecords}}
+        <div class="section">
+            <div class="section-header">
+                <h2>📋 DNS Records</h2>
+            </div>
+            <div style="padding: 1rem;">
+                {{if .DNSRecords.ARecords}}
+                <div style="margin-bottom: 1rem;">
+                    <strong style="color: var(--info);">🔢 A/AAAA Records:</strong>
+                    <ul style="margin-top: 0.5rem; padding-left: 2rem;">
+                        {{range .DNSRecords.ARecords}}<li><code>{{.}}</code></li>{{end}}
+                    </ul>
+                </div>
+                {{end}}
+                {{if .DNSRecords.MXRecords}}
+                <div style="margin-bottom: 1rem;">
+                    <strong style="color: var(--info);">📧 MX Records (Mail Servers):</strong>
+                    <ul style="margin-top: 0.5rem; padding-left: 2rem;">
+                        {{range .DNSRecords.MXRecords}}<li><code>{{.}}</code></li>{{end}}
+                    </ul>
+                </div>
+                {{end}}
+                {{if .DNSRecords.NSRecords}}
+                <div style="margin-bottom: 1rem;">
+                    <strong style="color: var(--info);">🌐 NS Records (Nameservers):</strong>
+                    <ul style="margin-top: 0.5rem; padding-left: 2rem;">
+                        {{range .DNSRecords.NSRecords}}<li><code>{{.}}</code></li>{{end}}
+                    </ul>
+                </div>
+                {{end}}
+                {{if .DNSRecords.TXTRecords}}
+                <div style="margin-bottom: 1rem;">
+                    <strong style="color: var(--info);">📝 TXT Records:</strong>
+                    <ul style="margin-top: 0.5rem; padding-left: 2rem;">
+                        {{range .DNSRecords.TXTRecords}}<li><code style="word-break: break-all;">{{.}}</code></li>{{end}}
+                    </ul>
+                </div>
+                {{end}}
+            </div>
+        </div>
+        {{end}}
+
+        {{if .GeoLocations}}
+        <div class="section">
+            <div class="section-header">
+                <h2>📍 IP Geolocation</h2>
+                <span class="count">{{len .GeoLocations}} IPs</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>IP Address</th>
+                        <th>Location</th>
+                        <th>ISP / Organization</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .GeoLocations}}
+                    <tr>
+                        <td><code>{{.IP}}</code></td>
+                        <td>{{.City}}, {{.Country}}</td>
+                        <td>{{.ISP}}{{if .Org}} ({{.Org}}){{end}}</td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+        {{end}}
+
         {{if .Subdomains}}
         <div class="section">
             <div class="section-header">
@@ -335,24 +426,28 @@ const htmlTemplate = `<!DOCTYPE html>
                 <h2>🔌 Open Ports</h2>
                 <span class="count">{{len .Ports}} found</span>
             </div>
+            {{if .CloudflareHosts}}
+            <div style="padding: 1rem; border-bottom: 1px solid var(--border);">
+                <strong style="color: var(--info);">☁️ Hosts behind Cloudflare:</strong>
+                <code style="margin-left: 0.5rem;">{{.CloudflareHosts}}</code>
+            </div>
+            {{end}}
             <table>
                 <thead>
                     <tr>
                         <th>Risk</th>
-                        <th>Host</th>
                         <th>Port</th>
                         <th>Service</th>
-                        <th>Banner</th>
+                        <th>Status</th>
                     </tr>
                 </thead>
                 <tbody>
                     {{range .Ports}}
                     <tr>
                         <td><span class="risk-badge risk-{{lower .Risk}}">{{.Risk}}</span></td>
-                        <td>{{.Host}}</td>
                         <td>{{.Port}}</td>
                         <td>{{.Service}}</td>
-                        <td><code>{{truncate .Banner 50}}</code></td>
+                        <td>{{if .IsCloudflare}}<span style="color: var(--info);">☁️ Cloudflare Proxy</span>{{else}}{{.Banner}}{{end}}</td>
                     </tr>
                     {{end}}
                 </tbody>
@@ -542,4 +637,91 @@ func OpenInBrowser(path string) error {
 	}
 
 	return cmd.Start()
+}
+
+// GenerateHTMLReportString generates an HTML report as a string (for API responses)
+func GenerateHTMLReportString(report *ScanReport) (string, error) {
+	funcMap := template.FuncMap{
+		"lower": func(s string) string {
+			if len(s) == 0 {
+				return s
+			}
+			return string([]byte{s[0] + 32}) + s[1:]
+		},
+		"truncate": func(s string, n int) string {
+			if len(s) <= n {
+				return s
+			}
+			return s[:n] + "..."
+		},
+	}
+
+	tmpl, err := template.New("report").Funcs(funcMap).Parse(htmlTemplate)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse template: %w", err)
+	}
+
+	report.EndTime = time.Now()
+	report.Duration = report.EndTime.Sub(report.StartTime)
+
+	// Sort all findings by severity (Critical first)
+	sortReportBySeverity(report)
+
+	// Calculate summary
+	report.Summary.TotalSubdomains = len(report.Subdomains)
+	report.Summary.TotalPaths = len(report.Paths)
+	report.Summary.TotalPorts = len(report.Ports)
+	report.Summary.TotalAuthTests = len(report.AuthResults)
+
+	// Count by risk
+	for _, p := range report.Paths {
+		switch p.Risk {
+		case "CRITICAL":
+			report.Summary.CriticalCount++
+		case "HIGH":
+			report.Summary.HighCount++
+		case "MEDIUM":
+			report.Summary.MediumCount++
+		case "LOW":
+			report.Summary.LowCount++
+		default:
+			report.Summary.InfoCount++
+		}
+	}
+
+	for _, p := range report.Ports {
+		switch p.Risk {
+		case "CRITICAL":
+			report.Summary.CriticalCount++
+		case "HIGH":
+			report.Summary.HighCount++
+		case "MEDIUM":
+			report.Summary.MediumCount++
+		case "LOW":
+			report.Summary.LowCount++
+		default:
+			report.Summary.InfoCount++
+		}
+	}
+
+	for _, a := range report.AuthResults {
+		switch a.Risk {
+		case "CRITICAL":
+			report.Summary.CriticalCount++
+		case "HIGH":
+			report.Summary.HighCount++
+		case "MEDIUM":
+			report.Summary.MediumCount++
+		case "LOW":
+			report.Summary.LowCount++
+		default:
+			report.Summary.InfoCount++
+		}
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, report); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
