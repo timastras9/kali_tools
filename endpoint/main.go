@@ -338,7 +338,7 @@ func main() {
 	// ==========================================
 	// PHASE 3: Port Scanning
 	// ==========================================
-	// Deduplicate hosts by IP and skip proxied (Cloudflare) hosts
+	// Deduplicate hosts by IP
 	ipToHost := make(map[string]string)    // IP -> first hostname with that IP
 	hostToIP := make(map[string]string)    // hostname -> IP (for reference)
 	hostsToScan := []string{}
@@ -352,10 +352,9 @@ func main() {
 		ip := ips[0]
 		hostToIP[h] = ip
 
-		// Check if IP is Cloudflare (proxied)
+		// Track if Cloudflare-proxied
 		if isCloudflareIP(ip) {
 			proxiedHosts = append(proxiedHosts, h)
-			continue
 		}
 
 		if _, exists := ipToHost[ip]; !exists {
@@ -365,27 +364,27 @@ func main() {
 		}
 	}
 
-	// Show skipped hosts
-	if len(proxiedHosts) > 0 {
-		fmt.Printf("\n   ☁️  Skipping proxied hosts (Cloudflare):\n")
-		for _, h := range proxiedHosts {
-			fmt.Printf("      %s (%s)\n", h, hostToIP[h])
-		}
-	}
-
-	if len(liveHosts) > len(hostsToScan)+len(proxiedHosts) {
-		fmt.Printf("   ℹ️  Skipping redundant hosts (same IP):\n")
+	// Show redundant hosts
+	if len(liveHosts) > len(hostsToScan) {
+		fmt.Printf("\n   ℹ️  Skipping redundant hosts (same IP):\n")
 		for _, h := range liveHosts {
 			ip := hostToIP[h]
 			primaryHost := ipToHost[ip]
-			if h != primaryHost && !isCloudflareIP(ip) {
+			if h != primaryHost {
 				fmt.Printf("      %s → same as %s (%s)\n", h, primaryHost, ip)
 			}
 		}
 	}
 
+	// Filter out Cloudflare-proxied ports
 	ports := scanner.Top100Ports
-	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d unique IPs, %d ports each)\n", len(hostsToScan), len(ports))
+	portsToScan := ports
+	if len(proxiedHosts) > 0 {
+		fmt.Printf("\n   ☁️  Cloudflare detected - skipping proxied ports (80, 443, 8080, 8443, 2052-2096)\n")
+		portsToScan = filterCloudfarePorts(ports)
+	}
+
+	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d unique IPs, %d ports each)\n", len(hostsToScan), len(portsToScan))
 	phaseStart = time.Now()
 
 	portScanner := scanner.NewPortScanner(*workers, timeoutDuration)
@@ -417,7 +416,7 @@ func main() {
 		}
 	}
 
-	portScanner.ScanMultipleHosts(hostsToScan, ports)
+	portScanner.ScanMultipleHosts(hostsToScan, portsToScan)
 	fmt.Printf("   Found %d open ports (%.1fs)\n", len(portScanner.Results), time.Since(phaseStart).Seconds())
 
 	// ==========================================
@@ -566,6 +565,25 @@ Top 25 Brute Force Subdomains:
 Compliance:
   Reports include OWASP Top 10, CWE, and NIST 800-53 mappings
 `)
+}
+
+// Cloudflare proxied ports - these just show Cloudflare, not origin
+var cloudflareProxiedPorts = map[int]bool{
+	80: true, 443: true, 8080: true, 8443: true,
+	2052: true, 2053: true, 2082: true, 2083: true,
+	2086: true, 2087: true, 2095: true, 2096: true,
+	8880: true,
+}
+
+// filterCloudfarePorts removes Cloudflare-proxied ports from the list
+func filterCloudfarePorts(ports []int) []int {
+	filtered := []int{}
+	for _, p := range ports {
+		if !cloudflareProxiedPorts[p] {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
 }
 
 // isCloudflareIP checks if an IP belongs to Cloudflare's network
