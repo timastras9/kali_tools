@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -172,4 +173,78 @@ func (ct *CTLookup) checkCommonDNSRecords(domain string) []string {
 	// This just returns the wordlist subdomains to check via DNS
 	// The actual DNS resolution happens in SubdomainScanner
 	return nil
+}
+
+// DNSEnumerator discovers subdomains via DNS records
+type DNSEnumerator struct {
+	Timeout time.Duration
+}
+
+// NewDNSEnumerator creates a new DNS enumerator
+func NewDNSEnumerator(timeout time.Duration) *DNSEnumerator {
+	return &DNSEnumerator{Timeout: timeout}
+}
+
+// FindSubdomainsViaDNS tries to discover subdomains through DNS records
+func (de *DNSEnumerator) FindSubdomainsViaDNS(domain string) []string {
+	subdomains := make(map[string]bool)
+
+	// Check various DNS record types that might reveal subdomains
+	// MX records often reveal mail subdomains
+	mxRecords, _ := net.LookupMX(domain)
+	for _, mx := range mxRecords {
+		host := strings.TrimSuffix(mx.Host, ".")
+		if de.isSubdomain(host, domain) {
+			subdomains[host] = true
+		}
+	}
+
+	// NS records
+	nsRecords, _ := net.LookupNS(domain)
+	for _, ns := range nsRecords {
+		host := strings.TrimSuffix(ns.Host, ".")
+		if de.isSubdomain(host, domain) {
+			subdomains[host] = true
+		}
+	}
+
+	// TXT records sometimes contain subdomain references
+	txtRecords, _ := net.LookupTXT(domain)
+	for _, txt := range txtRecords {
+		// Look for domain references in TXT records
+		pattern := regexp.MustCompile(`([a-zA-Z0-9][-a-zA-Z0-9]*\.)+` + regexp.QuoteMeta(domain))
+		matches := pattern.FindAllString(txt, -1)
+		for _, match := range matches {
+			if de.isSubdomain(match, domain) {
+				subdomains[match] = true
+			}
+		}
+	}
+
+	// Convert to slice
+	result := make([]string, 0, len(subdomains))
+	for sub := range subdomains {
+		result = append(result, sub)
+	}
+	return result
+}
+
+// CheckCNAME checks if a subdomain has a CNAME record
+func (de *DNSEnumerator) CheckCNAME(subdomain string) (string, bool) {
+	cname, err := net.LookupCNAME(subdomain)
+	if err != nil {
+		return "", false
+	}
+	cname = strings.TrimSuffix(cname, ".")
+	if cname != subdomain && cname != "" {
+		return cname, true
+	}
+	return "", false
+}
+
+// isSubdomain checks if host is a subdomain of domain
+func (de *DNSEnumerator) isSubdomain(host, domain string) bool {
+	host = strings.ToLower(host)
+	domain = strings.ToLower(domain)
+	return strings.HasSuffix(host, "."+domain) || host == domain
 }

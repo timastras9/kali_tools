@@ -291,8 +291,11 @@ func (ps *PathScanner) Scan(baseURL string, paths []string) []PathResult {
 
 			result := ps.checkPath(baseURL, p)
 
-			// Skip 404s, errors, and false positives (catch-all routes)
-			if result.StatusCode == 404 || result.StatusCode == 0 {
+			// Skip non-existent paths: 404, 403, 401, 5xx errors, and timeouts
+			// Only report paths that actually exist and are accessible
+			if result.StatusCode == 0 || result.StatusCode == 404 ||
+			   result.StatusCode == 403 || result.StatusCode == 401 ||
+			   result.StatusCode >= 500 {
 				if ps.OnProgress != nil {
 					ps.OnProgress(idx+1, total)
 				}

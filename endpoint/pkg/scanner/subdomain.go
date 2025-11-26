@@ -132,7 +132,7 @@ func (ss *SubdomainScanner) Scan(domain string, subdomains []string) []Subdomain
 			defer func() { <-semaphore }()
 
 			fullDomain := fmt.Sprintf("%s.%s", subdomain, domain)
-			result := ss.checkSubdomain(fullDomain)
+			result := ss.CheckSubdomain(fullDomain)
 
 			if result.Live {
 				ss.mu.Lock()
@@ -154,8 +154,8 @@ func (ss *SubdomainScanner) Scan(domain string, subdomains []string) []Subdomain
 	return ss.Results
 }
 
-// checkSubdomain verifies if a subdomain exists and is live
-func (ss *SubdomainScanner) checkSubdomain(domain string) SubdomainResult {
+// CheckSubdomain verifies if a subdomain exists and is live (exported)
+func (ss *SubdomainScanner) CheckSubdomain(domain string) SubdomainResult {
 	result := SubdomainResult{
 		Subdomain: domain,
 		Live:      false,

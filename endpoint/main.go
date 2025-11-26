@@ -13,20 +13,18 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "2.1.0"
+const version = "3.0.0"
 
 func main() {
-	// Parse flags BEFORE positional args
-	top50 := flag.Bool("top50", false, "Quick scan: 50 high-risk endpoints + top 50 ports")
-	_ = flag.Bool("top100", false, "Standard scan: 100 endpoints + top 100 ports (default)")
-	all := flag.Bool("all", false, "Full scan: extended wordlists + all ports")
-	workers := flag.Int("w", 100, "Number of concurrent workers")
-	timeout := flag.Int("timeout", 5, "Connection timeout in seconds")
+	// Parse flags
+	workers := flag.Int("w", 50, "Number of concurrent workers")
+	timeout := flag.Int("timeout", 10, "Connection timeout in seconds")
 	output := flag.String("o", "", "Output HTML report file")
 	serve := flag.Bool("serve", false, "Start web UI server")
 	port := flag.Int("port", 8080, "Web UI port")
 	stealth := flag.Bool("stealth", false, "Stealth mode: slower scan, random delays (bypass WAF/Cloudflare)")
 	delay := flag.Int("delay", 0, "Delay between requests in ms (0 = no delay)")
+	depth := flag.Int("depth", 3, "Crawl depth for endpoint discovery")
 	flag.Parse()
 
 	// Stealth mode overrides
@@ -35,7 +33,7 @@ func main() {
 			*workers = 10
 		}
 		if *delay == 0 {
-			*delay = 500 // 500ms delay in stealth mode
+			*delay = 500
 		}
 	}
 
@@ -50,37 +48,15 @@ func main() {
 	domain = strings.TrimPrefix(domain, "https://")
 	domain = strings.TrimSuffix(domain, "/")
 
-	// Determine scan mode
-	mode := "Standard (-top100)"
-	var subdomains, paths []string
-	var ports []int
-
-	switch {
-	case *top50:
-		mode = "Quick (-top50)"
-		subdomains = scanner.Top50Subdomains
-		paths = scanner.Top50Paths
-		ports = scanner.Top50Ports
-	case *all:
-		mode = "Full (-all)"
-		subdomains = scanner.ExtendedSubdomains
-		paths = scanner.ExtendedPaths
-		ports = scanner.Top100Ports
-	default: // top100 or default
-		subdomains = scanner.DefaultSubdomains
-		paths = scanner.Top100Paths
-		ports = scanner.Top100Ports
-	}
-
 	// Initialize report
 	scanReport := &report.ScanReport{
 		Target:    domain,
-		Mode:      mode,
+		Mode:      "Dynamic Discovery",
 		StartTime: time.Now(),
 	}
 
 	// Print header
-	printHeader(domain, mode, *workers)
+	printHeader(domain, *workers, *depth)
 
 	// Start web server if requested
 	var webServer *web.WebServer
@@ -92,152 +68,164 @@ func main() {
 	timeoutDuration := time.Duration(*timeout) * time.Second
 
 	// ==========================================
-	// PHASE 1: Subdomain Discovery (CT Logs + Wordlist)
+	// PHASE 1: Subdomain Discovery (CT Logs + DNS Records)
 	// ==========================================
-	fmt.Println("\n🔍 Phase 1a: Querying Certificate Transparency logs...")
-
-	// First, query CT logs for REAL subdomains
-	ctLookup := scanner.NewCTLookup(timeoutDuration)
-	ctSubdomains, err := ctLookup.FindSubdomains(domain)
-	if err != nil {
-		fmt.Printf("   ⚠️  CT lookup failed: %v (continuing with wordlist)\n", err)
-	} else {
-		fmt.Printf("   ✅ Found %d subdomains from CT logs\n", len(ctSubdomains))
-	}
-
-	// Combine CT results with wordlist (deduplicated)
-	allSubdomains := make(map[string]bool)
-
-	// Add CT-discovered subdomains (these are REAL)
-	for _, sub := range ctSubdomains {
-		// Extract just the subdomain part (e.g., "api" from "api.example.com")
-		sub = strings.TrimSuffix(sub, "."+domain)
-		if sub != "" && sub != domain {
-			allSubdomains[sub] = true
-		}
-	}
-
-	// Add wordlist subdomains
-	for _, sub := range subdomains {
-		allSubdomains[sub] = true
-	}
-
-	// Convert back to slice
-	combinedSubdomains := make([]string, 0, len(allSubdomains))
-	for sub := range allSubdomains {
-		combinedSubdomains = append(combinedSubdomains, sub)
-	}
-
-	report.PrintPhaseStart("Subdomain Verification", len(combinedSubdomains))
+	fmt.Println("\n🔍 Phase 1: Subdomain Discovery")
+	fmt.Println("   Searching CT logs, DNS records (MX, NS, TXT, CNAME)...")
 	phaseStart := time.Now()
 
-	subScanner := scanner.NewSubdomainScanner(*workers, timeoutDuration)
-	subScanner.OnResult = func(r scanner.SubdomainResult) {
-		report.PrintFindingInstant("INFO", r.Subdomain, fmt.Sprintf("%s [%d]", r.Scheme, r.StatusCode))
-		if webServer != nil {
-			webServer.AddFinding(web.LiveFinding{
-				Type:   "subdomain",
-				Risk:   "INFO",
-				Target: r.Subdomain,
-				Detail: fmt.Sprintf("%s [%d]", r.Scheme, r.StatusCode),
-			})
+	discoveredSubdomains := make(map[string]bool)
+
+	// 1a: Certificate Transparency logs
+	ctLookup := scanner.NewCTLookup(timeoutDuration)
+	ctSubs, err := ctLookup.FindSubdomains(domain)
+	if err == nil && len(ctSubs) > 0 {
+		fmt.Printf("   ✅ CT Logs: Found %d subdomains\n", len(ctSubs))
+		for _, sub := range ctSubs {
+			discoveredSubdomains[sub] = true
 		}
 	}
 
-	subResults := subScanner.Scan(domain, combinedSubdomains)
-	report.PrintPhaseComplete("Subdomain Verification", len(subResults), time.Since(phaseStart))
-
-	// Convert to report format
-	for _, r := range subResults {
-		scanReport.Subdomains = append(scanReport.Subdomains, report.SubdomainEntry{
-			Subdomain:  r.Subdomain,
-			IP:         r.IP,
-			StatusCode: r.StatusCode,
-			Scheme:     r.Scheme,
-		})
+	// 1b: DNS Records enumeration
+	dnsEnum := scanner.NewDNSEnumerator(timeoutDuration)
+	dnsSubs := dnsEnum.FindSubdomainsViaDNS(domain)
+	if len(dnsSubs) > 0 {
+		fmt.Printf("   ✅ DNS Records: Found %d subdomains\n", len(dnsSubs))
+		for _, sub := range dnsSubs {
+			discoveredSubdomains[sub] = true
+		}
 	}
 
-	// Collect all hosts to scan
-	hosts := []string{domain}
-	for _, r := range subResults {
-		hosts = append(hosts, r.Subdomain)
+	// Always add the base domain
+	discoveredSubdomains[domain] = true
+	discoveredSubdomains["www."+domain] = true
+
+	// Verify which subdomains are live
+	fmt.Printf("   Verifying %d potential subdomains...\n", len(discoveredSubdomains))
+	subScanner := scanner.NewSubdomainScanner(*workers, timeoutDuration)
+
+	// Convert to slice for scanning
+	subsToCheck := make([]string, 0)
+	for sub := range discoveredSubdomains {
+		// Extract just subdomain part if it's a full domain
+		if strings.HasSuffix(sub, "."+domain) {
+			sub = strings.TrimSuffix(sub, "."+domain)
+		}
+		if sub != domain && sub != "" {
+			subsToCheck = append(subsToCheck, sub)
+		}
 	}
 
+	subResults := subScanner.Scan(domain, subsToCheck)
+
+	// Add main domain to results
+	mainDomainResult := subScanner.CheckSubdomain(domain)
+	if mainDomainResult.Live {
+		subResults = append(subResults, mainDomainResult)
+	}
+
+	liveHosts := []string{}
+	for _, r := range subResults {
+		if r.Live {
+			liveHosts = append(liveHosts, r.Subdomain)
+			fmt.Printf("   ✅ LIVE: %s (%s)\n", r.Subdomain, r.IP)
+
+			// Check CNAME
+			if cname, hasCNAME := dnsEnum.CheckCNAME(r.Subdomain); hasCNAME {
+				fmt.Printf("      └─ CNAME: %s\n", cname)
+			}
+
+			scanReport.Subdomains = append(scanReport.Subdomains, report.SubdomainEntry{
+				Subdomain:  r.Subdomain,
+				IP:         r.IP,
+				StatusCode: r.StatusCode,
+				Scheme:     r.Scheme,
+			})
+
+			if webServer != nil {
+				webServer.AddFinding(web.LiveFinding{
+					Type:   "subdomain",
+					Risk:   "INFO",
+					Target: r.Subdomain,
+					Detail: fmt.Sprintf("%s [%d]", r.Scheme, r.StatusCode),
+				})
+			}
+		}
+	}
+
+	fmt.Printf("   Found %d live subdomains (%.1fs)\n", len(liveHosts), time.Since(phaseStart).Seconds())
+
 	// ==========================================
-	// PHASE 2: Path Discovery
+	// PHASE 2: Dynamic Endpoint Discovery (Crawling)
 	// ==========================================
-	report.PrintPhaseStart("Path Discovery", len(paths)*len(hosts))
+	fmt.Println("\n🕷️  Phase 2: Endpoint Discovery (Crawling)")
+	fmt.Println("   Crawling sites, parsing HTML/JS, checking robots.txt & sitemap.xml...")
 	phaseStart = time.Now()
 
-	pathScanner := scanner.NewPathScanner(*workers, timeoutDuration)
-	pathScanner.RateLimit = time.Duration(*delay) * time.Millisecond
-	pathScanner.OnResult = func(r scanner.PathResult) {
-		// Determine if vulnerable
-		vulnType := report.ClassifyPathVulnerability(r.Path)
-		owasp, cwe, nist := report.GetCompliance(string(vulnType))
+	crawler := scanner.NewCrawler(*workers, timeoutDuration)
+	crawler.MaxDepth = *depth
+	crawler.RateLimit = time.Duration(*delay) * time.Millisecond
+	crawler.OnResult = func(r scanner.CrawlResult) {
+		if r.StatusCode == 200 {
+			fmt.Printf("   ✅ [%s] %s\n", r.Type, r.URL)
 
-		risk := r.Risk
-		if r.StatusCode == 200 && (r.Risk == "CRITICAL" || r.Risk == "HIGH") {
-			report.PrintFindingInstant(risk, r.URL, fmt.Sprintf("VULNERABLE - %s", owasp))
-		} else {
-			report.PrintFindingInstant(risk, r.URL, fmt.Sprintf("[%d]", r.StatusCode))
+			if webServer != nil {
+				webServer.AddFinding(web.LiveFinding{
+					Type:   "endpoint",
+					Risk:   "INFO",
+					Target: r.URL,
+					Detail: fmt.Sprintf("[%d] %s (from %s)", r.StatusCode, r.Type, r.Source),
+				})
+			}
+		}
+	}
+
+	allEndpoints := make(map[string]scanner.CrawlResult)
+	for _, host := range liveHosts {
+		baseURL := fmt.Sprintf("https://%s", host)
+		results := crawler.Crawl(baseURL)
+		for _, r := range results {
+			if r.StatusCode == 200 {
+				allEndpoints[r.URL] = r
+			}
 		}
 
-		if webServer != nil {
-			webServer.AddFinding(web.LiveFinding{
-				Type:   "path",
-				Risk:   risk,
-				Target: r.URL,
-				Detail: fmt.Sprintf("[%d] %s", r.StatusCode, r.Category),
-			})
+		// Also try HTTP if HTTPS failed
+		baseURL = fmt.Sprintf("http://%s", host)
+		results = crawler.Crawl(baseURL)
+		for _, r := range results {
+			if r.StatusCode == 200 {
+				allEndpoints[r.URL] = r
+			}
 		}
+	}
 
+	// Convert to report format
+	for _, r := range allEndpoints {
 		scanReport.Paths = append(scanReport.Paths, report.PathEntry{
 			URL:        r.URL,
-			Path:       r.Path,
+			Path:       r.URL,
 			StatusCode: r.StatusCode,
-			Size:       r.Size,
-			Risk:       r.Risk,
-			Category:   r.Category,
-			OWASP:      owasp,
-			CWE:        cwe,
-			NIST:       nist,
+			Risk:       "INFO",
+			Category:   r.Type,
 		})
 	}
 
-	for _, host := range hosts {
-		baseURL := fmt.Sprintf("https://%s", host)
-		pathScanner.Scan(baseURL, paths)
-	}
-	report.PrintPhaseComplete("Path Discovery", len(pathScanner.Results), time.Since(phaseStart))
+	fmt.Printf("   Found %d unique endpoints (%.1fs)\n", len(allEndpoints), time.Since(phaseStart).Seconds())
 
 	// ==========================================
 	// PHASE 3: Port Scanning
 	// ==========================================
-	report.PrintPhaseStart("Port Scanning", len(ports)*len(hosts))
+	ports := scanner.Top100Ports
+	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d ports per host)\n", len(ports))
 	phaseStart = time.Now()
 
 	portScanner := scanner.NewPortScanner(*workers, timeoutDuration)
 	portScanner.OnResult = func(r scanner.PortResult) {
+		fmt.Printf("   ✅ %s:%d - %s\n", r.Host, r.Port, r.Service)
+
 		vulnType := report.ClassifyServiceVulnerability(r.Service, false)
 		owasp, cwe, nist := report.GetCompliance(string(vulnType))
-
-		if r.Risk == "CRITICAL" || r.Risk == "HIGH" {
-			report.PrintFindingInstant(r.Risk, fmt.Sprintf("%s:%d", r.Host, r.Port),
-				fmt.Sprintf("VULNERABLE - %s (%s)", r.Service, owasp))
-		} else {
-			report.PrintFindingInstant(r.Risk, fmt.Sprintf("%s:%d", r.Host, r.Port), r.Service)
-		}
-
-		if webServer != nil {
-			webServer.AddFinding(web.LiveFinding{
-				Type:    "port",
-				Risk:    r.Risk,
-				Target:  fmt.Sprintf("%s:%d", r.Host, r.Port),
-				Detail:  r.Service,
-				Service: r.Service,
-			})
-		}
 
 		scanReport.Ports = append(scanReport.Ports, report.PortEntry{
 			Host:    r.Host,
@@ -249,23 +237,24 @@ func main() {
 			CWE:     cwe,
 			NIST:    nist,
 		})
+
+		if webServer != nil {
+			webServer.AddFinding(web.LiveFinding{
+				Type:    "port",
+				Risk:    r.Risk,
+				Target:  fmt.Sprintf("%s:%d", r.Host, r.Port),
+				Detail:  r.Service,
+				Service: r.Service,
+			})
+		}
 	}
 
-	portScanner.ScanMultipleHosts(hosts, ports)
-	report.PrintPhaseComplete("Port Scanning", len(portScanner.Results), time.Since(phaseStart))
+	portScanner.ScanMultipleHosts(liveHosts, ports)
+	fmt.Printf("   Found %d open ports (%.1fs)\n", len(portScanner.Results), time.Since(phaseStart).Seconds())
 
 	// ==========================================
-	// PHASE 4: Service Detection (from port results)
+	// PHASE 4: Auth Testing
 	// ==========================================
-	report.PrintPhaseStart("Service Detection", len(portScanner.Results))
-	phaseStart = time.Now()
-	// Service detection already done during port scanning
-	report.PrintPhaseComplete("Service Detection", len(portScanner.Results), time.Since(phaseStart))
-
-	// ==========================================
-	// PHASE 5: Auth Testing
-	// ==========================================
-	// Get unique services to test
 	servicesToTest := make(map[string]struct {
 		host    string
 		port    int
@@ -283,75 +272,72 @@ func main() {
 		}
 	}
 
-	report.PrintPhaseStart("Auth Testing", len(servicesToTest))
-	phaseStart = time.Now()
+	if len(servicesToTest) > 0 {
+		fmt.Printf("\n🔐 Phase 4: Auth Testing (%d services)\n", len(servicesToTest))
+		phaseStart = time.Now()
 
-	authTester := auth.NewAuthTester(timeoutDuration, *workers)
-	authTester.OnResult = func(r auth.AuthResult) {
-		vulnType := report.ClassifyServiceVulnerability(r.Service, r.AuthNeeded)
-		owasp, cwe, nist := report.GetCompliance(string(vulnType))
+		authTester := auth.NewAuthTester(timeoutDuration, *workers)
+		authTester.OnResult = func(r auth.AuthResult) {
+			if r.Credential != nil {
+				fmt.Printf("   🚨 CRITICAL: %s:%d (%s) - Default creds: %s:%s\n",
+					r.Host, r.Port, r.Service, r.Credential.Username, r.Credential.Password)
+			} else if !r.AuthNeeded {
+				fmt.Printf("   ⚠️  HIGH: %s:%d (%s) - No auth required\n",
+					r.Host, r.Port, r.Service)
+			}
 
-		if r.Credential != nil {
-			report.PrintFindingInstant("CRITICAL",
-				fmt.Sprintf("%s:%d (%s)", r.Host, r.Port, r.Service),
-				fmt.Sprintf("VULNERABLE - Default creds work: %s:%s (%s)", r.Credential.Username, r.Credential.Password, owasp))
-		} else if !r.AuthNeeded {
-			report.PrintFindingInstant("HIGH",
-				fmt.Sprintf("%s:%d (%s)", r.Host, r.Port, r.Service),
-				fmt.Sprintf("VULNERABLE - No auth required (%s)", owasp))
-		}
+			vulnType := report.ClassifyServiceVulnerability(r.Service, r.AuthNeeded)
+			owasp, cwe, nist := report.GetCompliance(string(vulnType))
 
-		if webServer != nil {
-			webServer.AddFinding(web.LiveFinding{
-				Type:    "auth",
-				Risk:    r.Risk,
-				Target:  fmt.Sprintf("%s:%d", r.Host, r.Port),
-				Detail:  r.Message,
-				Service: r.Service,
+			username := ""
+			password := ""
+			if r.Credential != nil {
+				username = r.Credential.Username
+				password = r.Credential.Password
+			}
+
+			scanReport.AuthResults = append(scanReport.AuthResults, report.AuthEntry{
+				Host:       r.Host,
+				Port:       r.Port,
+				Service:    r.Service,
+				AuthNeeded: r.AuthNeeded,
+				Username:   username,
+				Password:   password,
+				Risk:       r.Risk,
+				Message:    r.Message,
+				OWASP:      owasp,
+				CWE:        cwe,
+				NIST:       nist,
 			})
+
+			if webServer != nil {
+				webServer.AddFinding(web.LiveFinding{
+					Type:    "auth",
+					Risk:    r.Risk,
+					Target:  fmt.Sprintf("%s:%d", r.Host, r.Port),
+					Detail:  r.Message,
+					Service: r.Service,
+				})
+			}
 		}
 
-		username := ""
-		password := ""
-		if r.Credential != nil {
-			username = r.Credential.Username
-			password = r.Credential.Password
+		for _, s := range servicesToTest {
+			authTester.TestService(s.host, s.port, s.service)
 		}
-
-		scanReport.AuthResults = append(scanReport.AuthResults, report.AuthEntry{
-			Host:       r.Host,
-			Port:       r.Port,
-			Service:    r.Service,
-			AuthNeeded: r.AuthNeeded,
-			Username:   username,
-			Password:   password,
-			Risk:       r.Risk,
-			Message:    r.Message,
-			OWASP:      owasp,
-			CWE:        cwe,
-			NIST:       nist,
-		})
+		fmt.Printf("   Tested %d services (%.1fs)\n", len(authTester.Results), time.Since(phaseStart).Seconds())
 	}
-
-	for _, s := range servicesToTest {
-		authTester.TestService(s.host, s.port, s.service)
-	}
-	report.PrintPhaseComplete("Auth Testing", len(authTester.Results), time.Since(phaseStart))
 
 	// ==========================================
 	// Generate Report
 	// ==========================================
-	fmt.Println()
-
-	// Print summary
 	totalFindings := len(scanReport.Subdomains) + len(scanReport.Paths) + len(scanReport.Ports) + len(scanReport.AuthResults)
 	duration := time.Since(scanReport.StartTime)
 
 	fmt.Printf("\n✅ Scan Complete!\n")
 	fmt.Printf("   Duration: %s\n", duration.Round(time.Second))
 	fmt.Printf("   Total Findings: %d\n", totalFindings)
-	fmt.Printf("   Subdomains: %d\n", len(scanReport.Subdomains))
-	fmt.Printf("   Paths: %d\n", len(scanReport.Paths))
+	fmt.Printf("   Live Subdomains: %d\n", len(scanReport.Subdomains))
+	fmt.Printf("   Endpoints: %d\n", len(scanReport.Paths))
 	fmt.Printf("   Open Ports: %d\n", len(scanReport.Ports))
 	fmt.Printf("   Auth Tests: %d\n", len(scanReport.AuthResults))
 
@@ -367,13 +353,11 @@ func main() {
 	} else {
 		fmt.Printf("\n📄 Report saved to: %s\n", outputFile)
 
-		// Open in browser
 		if openErr := report.OpenInBrowser(outputFile); openErr == nil {
 			fmt.Println("🌐 Opening report in browser...")
 		}
 	}
 
-	// Keep web server running if started
 	if *serve {
 		fmt.Printf("\n🌐 Web UI running at http://localhost:%d\n", *port)
 		fmt.Println("Press Ctrl+C to stop...")
@@ -383,43 +367,41 @@ func main() {
 
 func printUsage() {
 	fmt.Printf(`
-Endpoint Scanner v%s - Security Reconnaissance Tool
+Endpoint Scanner v%s - Dynamic Security Reconnaissance
 
 Usage:
-  go run . <domain> [options]
+  endpoint <domain> [options]
 
 Examples:
-  go run . example.com                    # Standard scan (top100)
-  go run . example.com -top50             # Quick scan
-  go run . example.com -all               # Full comprehensive scan
-  go run . example.com -all -o report.html
-  go run . example.com -serve             # Start web UI
+  endpoint example.com                    # Full dynamic scan
+  endpoint example.com -stealth           # Stealth mode (slower, evades WAF)
+  endpoint example.com -depth 5           # Deeper crawl
+  endpoint example.com -o report.html     # Custom report name
+  endpoint example.com -serve             # Start web UI
 
 Options:
 `, version)
 	flag.PrintDefaults()
 	fmt.Println(`
-Scan Modes:
-  -top50    Quick scan: 50 high-risk paths + 50 critical ports
-  -top100   Standard scan (default): 100 paths + 100 ports
-  -all      Full scan: Extended wordlists, all common ports
+Discovery Methods:
+  - Certificate Transparency logs (crt.sh)
+  - DNS Records (MX, NS, TXT, CNAME)
+  - Web crawling (HTML links, JavaScript API endpoints)
+  - robots.txt and sitemap.xml parsing
 
 Compliance:
   Reports include OWASP Top 10, CWE, and NIST 800-53 mappings
-
-Output:
-  HTML report auto-generated and opened in browser
-  Use -serve for live web UI at localhost:8080
 `)
 }
 
-func printHeader(domain, mode string, workers int) {
+func printHeader(domain string, workers, depth int) {
 	fmt.Printf(`
 ╭─────────────────────────────────────────────────────────╮
 │  ENDPOINT SCANNER v%s                                │
 │  Target: %-45s │
-│  Mode: %-47s │
+│  Mode: Dynamic Discovery                                │
 │  Workers: %-44d │
+│  Crawl Depth: %-40d │
 ╰─────────────────────────────────────────────────────────╯
-`, version, domain, mode, workers)
+`, version, domain, workers, depth)
 }
