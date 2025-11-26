@@ -46,6 +46,7 @@ var DefaultSubdomains = []string{
 	"auth", "oauth", "sso", "token", "tokens", "jwt", "identity", "id",
 	"accounts", "account", "signin", "signup", "register", "password",
 	"2fa", "mfa", "otp", "verify", "verification", "activate",
+	"security", "secure", "ssl", "tls", "certs", "certificates",
 	// Cloud & Services
 	"aws", "azure", "gcp", "cloud", "s3", "storage", "backup",
 	"pay", "payment", "payments", "billing", "checkout", "cart",
@@ -62,8 +63,8 @@ var Top50Subdomains = []string{
 	"git", "svn", "repo", "registry", "harbor",
 	"logs", "monitoring", "metrics", "status", "health",
 	"debug", "trace", "profile", "admin-panel", "phpmyadmin",
-	// Auth critical
-	"auth", "oauth", "sso", "token", "jwt", "identity", "accounts",
+	// Auth & Security critical
+	"auth", "oauth", "sso", "token", "jwt", "identity", "accounts", "security",
 }
 
 // Extended subdomains for -all mode
