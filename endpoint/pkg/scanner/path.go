@@ -3,6 +3,7 @@ package scanner
 import (
 	"crypto/tls"
 	"io"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,19 +12,21 @@ import (
 
 // PathResult holds discovered path info
 type PathResult struct {
-	URL        string
-	Path       string
-	StatusCode int
-	Size       int64
-	Risk       string
-	Category   string
+	URL          string
+	Path         string
+	StatusCode   int
+	Size         int64
+	Risk         string
+	Category     string
+	ContentSample string // First 200 chars for comparison
 }
 
 // Baseline holds the response characteristics of a non-existent path
 type Baseline struct {
-	StatusCode int
-	Size       int64
-	SizeRange  int64 // Allow +/- this much variance
+	StatusCode  int
+	Size        int64
+	SizeRange   int64  // Allow +/- this much variance
+	ContentHash string // First 500 chars of body for comparison
 }
 
 // PathScanner handles async path discovery
@@ -37,6 +40,7 @@ type PathScanner struct {
 	UserAgents []string
 	agentIdx   int
 	Baseline   *Baseline
+	RateLimit  time.Duration // Delay between requests (for evasion)
 }
 
 // Top 50 high-risk paths (for -top50)
@@ -203,12 +207,13 @@ func (ps *PathScanner) EstablishBaseline(baseURL string) {
 
 	result := ps.checkPath(baseURL, randomPath)
 
-	// If we get a 200 response, this site has a catch-all
-	if result.StatusCode == 200 {
+	// If we get a 200 or redirect, this site has a catch-all
+	if result.StatusCode == 200 || result.StatusCode == 301 || result.StatusCode == 302 || result.StatusCode == 308 {
 		ps.Baseline = &Baseline{
-			StatusCode: result.StatusCode,
-			Size:       result.Size,
-			SizeRange:  500, // Allow 500 bytes variance for dynamic content
+			StatusCode:  result.StatusCode,
+			Size:        result.Size,
+			SizeRange:   1000, // Allow 1000 bytes variance for dynamic content
+			ContentHash: result.ContentSample,
 		}
 	}
 }
@@ -217,6 +222,22 @@ func (ps *PathScanner) EstablishBaseline(baseURL string) {
 func (ps *PathScanner) IsFalsePositive(result PathResult) bool {
 	if ps.Baseline == nil {
 		return false
+	}
+
+	// If content is very similar to baseline, it's a false positive
+	if ps.Baseline.ContentHash != "" && result.ContentSample != "" {
+		// Check if content samples are similar (first 100 chars match)
+		baselinePrefix := ps.Baseline.ContentHash
+		resultPrefix := result.ContentSample
+		if len(baselinePrefix) > 100 {
+			baselinePrefix = baselinePrefix[:100]
+		}
+		if len(resultPrefix) > 100 {
+			resultPrefix = resultPrefix[:100]
+		}
+		if baselinePrefix == resultPrefix {
+			return true
+		}
 	}
 
 	// If status code matches baseline and size is within range, it's likely a false positive
@@ -228,6 +249,12 @@ func (ps *PathScanner) IsFalsePositive(result PathResult) bool {
 		if sizeDiff <= ps.Baseline.SizeRange {
 			return true
 		}
+	}
+
+	// Redirects to home are often false positives
+	if (result.StatusCode == 301 || result.StatusCode == 302 || result.StatusCode == 308) &&
+		(ps.Baseline.StatusCode == 301 || ps.Baseline.StatusCode == 302 || ps.Baseline.StatusCode == 308) {
+		return true
 	}
 
 	return false
@@ -255,6 +282,12 @@ func (ps *PathScanner) Scan(baseURL string, paths []string) []PathResult {
 		go func(p string, idx int) {
 			defer wg.Done()
 			defer func() { <-semaphore }()
+
+			// Random delay for rate limiting/evasion
+			if ps.RateLimit > 0 {
+				jitter := time.Duration(rand.Int63n(int64(ps.RateLimit)))
+				time.Sleep(ps.RateLimit/2 + jitter)
+			}
 
 			result := ps.checkPath(baseURL, p)
 
@@ -349,12 +382,15 @@ func (ps *PathScanner) checkPath(baseURL, path string) PathResult {
 
 	result.StatusCode = resp.StatusCode
 
-	// Get content length
-	if resp.ContentLength > 0 {
-		result.Size = resp.ContentLength
+	// Read body for size and content comparison
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	result.Size = int64(len(body))
+
+	// Store content sample for false positive detection
+	if len(body) > 200 {
+		result.ContentSample = string(body[:200])
 	} else {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-		result.Size = int64(len(body))
+		result.ContentSample = string(body)
 	}
 
 	return result

@@ -13,7 +13,7 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "2.0.1"
+const version = "2.0.2"
 
 func main() {
 	// Parse flags BEFORE positional args
@@ -25,7 +25,19 @@ func main() {
 	output := flag.String("o", "", "Output HTML report file")
 	serve := flag.Bool("serve", false, "Start web UI server")
 	port := flag.Int("port", 8080, "Web UI port")
+	stealth := flag.Bool("stealth", false, "Stealth mode: slower scan, random delays (bypass WAF/Cloudflare)")
+	delay := flag.Int("delay", 0, "Delay between requests in ms (0 = no delay)")
 	flag.Parse()
+
+	// Stealth mode overrides
+	if *stealth {
+		if *workers > 10 {
+			*workers = 10
+		}
+		if *delay == 0 {
+			*delay = 500 // 500ms delay in stealth mode
+		}
+	}
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -124,6 +136,7 @@ func main() {
 	phaseStart = time.Now()
 
 	pathScanner := scanner.NewPathScanner(*workers, timeoutDuration)
+	pathScanner.RateLimit = time.Duration(*delay) * time.Millisecond
 	pathScanner.OnResult = func(r scanner.PathResult) {
 		// Determine if vulnerable
 		vulnType := report.ClassifyPathVulnerability(r.Path)
