@@ -14,7 +14,7 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "3.2.0"
+const version = "3.3.0"
 
 // Top 25 most common subdomains for brute forcing
 var Top25Subdomains = []string{
@@ -338,10 +338,11 @@ func main() {
 	// ==========================================
 	// PHASE 3: Port Scanning
 	// ==========================================
-	// Deduplicate hosts by IP to avoid redundant scanning
+	// Deduplicate hosts by IP and skip proxied (Cloudflare) hosts
 	ipToHost := make(map[string]string)    // IP -> first hostname with that IP
 	hostToIP := make(map[string]string)    // hostname -> IP (for reference)
 	hostsToScan := []string{}
+	proxiedHosts := []string{}
 
 	for _, h := range liveHosts {
 		ips, err := net.LookupHost(h)
@@ -351,6 +352,12 @@ func main() {
 		ip := ips[0]
 		hostToIP[h] = ip
 
+		// Check if IP is Cloudflare (proxied)
+		if isCloudflareIP(ip) {
+			proxiedHosts = append(proxiedHosts, h)
+			continue
+		}
+
 		if _, exists := ipToHost[ip]; !exists {
 			// First host with this IP - scan it
 			ipToHost[ip] = h
@@ -358,13 +365,20 @@ func main() {
 		}
 	}
 
-	// Show which hosts share IPs
-	if len(liveHosts) > len(hostsToScan) {
-		fmt.Printf("\n   ℹ️  Skipping redundant hosts (same IP):\n")
+	// Show skipped hosts
+	if len(proxiedHosts) > 0 {
+		fmt.Printf("\n   ☁️  Skipping proxied hosts (Cloudflare):\n")
+		for _, h := range proxiedHosts {
+			fmt.Printf("      %s (%s)\n", h, hostToIP[h])
+		}
+	}
+
+	if len(liveHosts) > len(hostsToScan)+len(proxiedHosts) {
+		fmt.Printf("   ℹ️  Skipping redundant hosts (same IP):\n")
 		for _, h := range liveHosts {
 			ip := hostToIP[h]
 			primaryHost := ipToHost[ip]
-			if h != primaryHost {
+			if h != primaryHost && !isCloudflareIP(ip) {
 				fmt.Printf("      %s → same as %s (%s)\n", h, primaryHost, ip)
 			}
 		}
@@ -552,6 +566,38 @@ Top 25 Brute Force Subdomains:
 Compliance:
   Reports include OWASP Top 10, CWE, and NIST 800-53 mappings
 `)
+}
+
+// isCloudflareIP checks if an IP belongs to Cloudflare's network
+func isCloudflareIP(ip string) bool {
+	// Cloudflare IPv4 ranges
+	cfPrefixes := []string{
+		"104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.", "104.22.", "104.23.",
+		"104.24.", "104.25.", "104.26.", "104.27.", "104.28.", "104.29.", "104.30.", "104.31.",
+		"172.64.", "172.65.", "172.66.", "172.67.", "172.68.", "172.69.", "172.70.", "172.71.",
+		"173.245.", "141.101.", "108.162.", "162.158.", "162.159.",
+		"190.93.", "188.114.", "197.234.", "198.41.",
+		"103.21.", "103.22.", "103.31.",
+	}
+
+	// Cloudflare IPv6 prefixes
+	cfIPv6Prefixes := []string{
+		"2606:4700:", "2803:f800:", "2400:cb00:", "2405:b500:", "2405:8100:", "2a06:98c0:",
+	}
+
+	for _, prefix := range cfPrefixes {
+		if strings.HasPrefix(ip, prefix) {
+			return true
+		}
+	}
+
+	for _, prefix := range cfIPv6Prefixes {
+		if strings.HasPrefix(ip, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func printHeader(domain string, workers, depth int) {
