@@ -13,7 +13,7 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "2.0.2"
+const version = "2.1.0"
 
 func main() {
 	// Parse flags BEFORE positional args
@@ -92,9 +92,43 @@ func main() {
 	timeoutDuration := time.Duration(*timeout) * time.Second
 
 	// ==========================================
-	// PHASE 1: Subdomain Discovery
+	// PHASE 1: Subdomain Discovery (CT Logs + Wordlist)
 	// ==========================================
-	report.PrintPhaseStart("Subdomain Discovery", len(subdomains))
+	fmt.Println("\n🔍 Phase 1a: Querying Certificate Transparency logs...")
+
+	// First, query CT logs for REAL subdomains
+	ctLookup := scanner.NewCTLookup(timeoutDuration)
+	ctSubdomains, err := ctLookup.FindSubdomains(domain)
+	if err != nil {
+		fmt.Printf("   ⚠️  CT lookup failed: %v (continuing with wordlist)\n", err)
+	} else {
+		fmt.Printf("   ✅ Found %d subdomains from CT logs\n", len(ctSubdomains))
+	}
+
+	// Combine CT results with wordlist (deduplicated)
+	allSubdomains := make(map[string]bool)
+
+	// Add CT-discovered subdomains (these are REAL)
+	for _, sub := range ctSubdomains {
+		// Extract just the subdomain part (e.g., "api" from "api.example.com")
+		sub = strings.TrimSuffix(sub, "."+domain)
+		if sub != "" && sub != domain {
+			allSubdomains[sub] = true
+		}
+	}
+
+	// Add wordlist subdomains
+	for _, sub := range subdomains {
+		allSubdomains[sub] = true
+	}
+
+	// Convert back to slice
+	combinedSubdomains := make([]string, 0, len(allSubdomains))
+	for sub := range allSubdomains {
+		combinedSubdomains = append(combinedSubdomains, sub)
+	}
+
+	report.PrintPhaseStart("Subdomain Verification", len(combinedSubdomains))
 	phaseStart := time.Now()
 
 	subScanner := scanner.NewSubdomainScanner(*workers, timeoutDuration)
@@ -110,8 +144,8 @@ func main() {
 		}
 	}
 
-	subResults := subScanner.Scan(domain, subdomains)
-	report.PrintPhaseComplete("Subdomain Discovery", len(subResults), time.Since(phaseStart))
+	subResults := subScanner.Scan(domain, combinedSubdomains)
+	report.PrintPhaseComplete("Subdomain Verification", len(subResults), time.Since(phaseStart))
 
 	// Convert to report format
 	for _, r := range subResults {
@@ -327,14 +361,14 @@ func main() {
 		outputFile = fmt.Sprintf("report_%s_%s.html", domain, time.Now().Format("20060102_150405"))
 	}
 
-	err := report.GenerateHTMLReport(scanReport, outputFile)
-	if err != nil {
-		fmt.Printf("\n❌ Failed to generate report: %v\n", err)
+	reportErr := report.GenerateHTMLReport(scanReport, outputFile)
+	if reportErr != nil {
+		fmt.Printf("\n❌ Failed to generate report: %v\n", reportErr)
 	} else {
 		fmt.Printf("\n📄 Report saved to: %s\n", outputFile)
 
 		// Open in browser
-		if err := report.OpenInBrowser(outputFile); err == nil {
+		if openErr := report.OpenInBrowser(outputFile); openErr == nil {
 			fmt.Println("🌐 Opening report in browser...")
 		}
 	}
