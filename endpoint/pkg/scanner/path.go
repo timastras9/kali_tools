@@ -19,6 +19,13 @@ type PathResult struct {
 	Category   string
 }
 
+// Baseline holds the response characteristics of a non-existent path
+type Baseline struct {
+	StatusCode int
+	Size       int64
+	SizeRange  int64 // Allow +/- this much variance
+}
+
 // PathScanner handles async path discovery
 type PathScanner struct {
 	Workers    int
@@ -29,6 +36,7 @@ type PathScanner struct {
 	OnProgress func(current, total int)
 	UserAgents []string
 	agentIdx   int
+	Baseline   *Baseline
 }
 
 // Top 50 high-risk paths (for -top50)
@@ -188,6 +196,43 @@ func NewPathScanner(workers int, timeout time.Duration) *PathScanner {
 	}
 }
 
+// EstablishBaseline checks a random non-existent path to detect catch-all routes
+func (ps *PathScanner) EstablishBaseline(baseURL string) {
+	// Generate random path that shouldn't exist
+	randomPath := "/zxcvbnm98765432qwerty_nonexistent_path_test"
+
+	result := ps.checkPath(baseURL, randomPath)
+
+	// If we get a 200 response, this site has a catch-all
+	if result.StatusCode == 200 {
+		ps.Baseline = &Baseline{
+			StatusCode: result.StatusCode,
+			Size:       result.Size,
+			SizeRange:  500, // Allow 500 bytes variance for dynamic content
+		}
+	}
+}
+
+// IsFalsePositive checks if a result matches the baseline (catch-all response)
+func (ps *PathScanner) IsFalsePositive(result PathResult) bool {
+	if ps.Baseline == nil {
+		return false
+	}
+
+	// If status code matches baseline and size is within range, it's likely a false positive
+	if result.StatusCode == ps.Baseline.StatusCode {
+		sizeDiff := result.Size - ps.Baseline.Size
+		if sizeDiff < 0 {
+			sizeDiff = -sizeDiff
+		}
+		if sizeDiff <= ps.Baseline.SizeRange {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Scan discovers paths on a host
 func (ps *PathScanner) Scan(baseURL string, paths []string) []PathResult {
 	var wg sync.WaitGroup
@@ -200,6 +245,9 @@ func (ps *PathScanner) Scan(baseURL string, paths []string) []PathResult {
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
+	// Establish baseline to detect catch-all routes
+	ps.EstablishBaseline(baseURL)
+
 	for i, path := range paths {
 		wg.Add(1)
 		semaphore <- struct{}{}
@@ -209,14 +257,29 @@ func (ps *PathScanner) Scan(baseURL string, paths []string) []PathResult {
 			defer func() { <-semaphore }()
 
 			result := ps.checkPath(baseURL, p)
-			if result.StatusCode != 404 && result.StatusCode != 0 {
-				ps.mu.Lock()
-				ps.Results = append(ps.Results, result)
-				ps.mu.Unlock()
 
-				if ps.OnResult != nil {
-					ps.OnResult(result)
+			// Skip 404s, errors, and false positives (catch-all routes)
+			if result.StatusCode == 404 || result.StatusCode == 0 {
+				if ps.OnProgress != nil {
+					ps.OnProgress(idx+1, total)
 				}
+				return
+			}
+
+			// Check if this is a false positive (matches catch-all baseline)
+			if ps.IsFalsePositive(result) {
+				if ps.OnProgress != nil {
+					ps.OnProgress(idx+1, total)
+				}
+				return
+			}
+
+			ps.mu.Lock()
+			ps.Results = append(ps.Results, result)
+			ps.mu.Unlock()
+
+			if ps.OnResult != nil {
+				ps.OnResult(result)
 			}
 
 			if ps.OnProgress != nil {

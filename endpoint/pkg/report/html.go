@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"time"
 )
 
@@ -402,10 +403,47 @@ const htmlTemplate = `<!DOCTYPE html>
 </body>
 </html>`
 
+// riskPriority returns a numeric priority for sorting (lower = more critical)
+func riskPriority(risk string) int {
+	switch risk {
+	case "CRITICAL":
+		return 0
+	case "HIGH":
+		return 1
+	case "MEDIUM":
+		return 2
+	case "LOW":
+		return 3
+	default:
+		return 4 // INFO
+	}
+}
+
+// sortReportBySeverity sorts all findings by severity (Critical first)
+func sortReportBySeverity(report *ScanReport) {
+	// Sort paths by risk
+	sort.Slice(report.Paths, func(i, j int) bool {
+		return riskPriority(report.Paths[i].Risk) < riskPriority(report.Paths[j].Risk)
+	})
+
+	// Sort ports by risk
+	sort.Slice(report.Ports, func(i, j int) bool {
+		return riskPriority(report.Ports[i].Risk) < riskPriority(report.Ports[j].Risk)
+	})
+
+	// Sort auth results by risk
+	sort.Slice(report.AuthResults, func(i, j int) bool {
+		return riskPriority(report.AuthResults[i].Risk) < riskPriority(report.AuthResults[j].Risk)
+	})
+}
+
 // GenerateHTMLReport creates an HTML report
 func GenerateHTMLReport(report *ScanReport, outputPath string) error {
 	funcMap := template.FuncMap{
 		"lower": func(s string) string {
+			if len(s) == 0 {
+				return s
+			}
 			return string([]byte{s[0] + 32}) + s[1:]
 		},
 		"truncate": func(s string, n int) string {
@@ -429,6 +467,9 @@ func GenerateHTMLReport(report *ScanReport, outputPath string) error {
 
 	report.EndTime = time.Now()
 	report.Duration = report.EndTime.Sub(report.StartTime)
+
+	// Sort all findings by severity (Critical first)
+	sortReportBySeverity(report)
 
 	// Calculate summary
 	report.Summary.TotalSubdomains = len(report.Subdomains)

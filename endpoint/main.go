@@ -13,7 +13,7 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "2.0.0"
+const version = "2.0.1"
 
 func main() {
 	// Parse flags BEFORE positional args
@@ -246,11 +246,11 @@ func main() {
 
 		if r.Credential != nil {
 			report.PrintFindingInstant("CRITICAL",
-				fmt.Sprintf("%s:%d", r.Host, r.Port),
-				fmt.Sprintf("VULNERABLE - Default creds: %s:%s (%s)", r.Credential.Username, r.Credential.Password, owasp))
+				fmt.Sprintf("%s:%d (%s)", r.Host, r.Port, r.Service),
+				fmt.Sprintf("VULNERABLE - Default creds work: %s:%s (%s)", r.Credential.Username, r.Credential.Password, owasp))
 		} else if !r.AuthNeeded {
 			report.PrintFindingInstant("HIGH",
-				fmt.Sprintf("%s:%d", r.Host, r.Port),
+				fmt.Sprintf("%s:%d (%s)", r.Host, r.Port, r.Service),
 				fmt.Sprintf("VULNERABLE - No auth required (%s)", owasp))
 		}
 
