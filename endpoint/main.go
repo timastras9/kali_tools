@@ -13,7 +13,16 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "3.0.0"
+const version = "3.1.0"
+
+// Top 25 most common subdomains for brute forcing
+var Top25Subdomains = []string{
+	"www", "mail", "api", "admin", "dev",
+	"staging", "test", "app", "portal", "secure",
+	"vpn", "remote", "login", "dashboard", "cdn",
+	"static", "assets", "blog", "shop", "support",
+	"docs", "help", "status", "auth", "token",
+}
 
 func main() {
 	// Parse flags
@@ -25,6 +34,7 @@ func main() {
 	stealth := flag.Bool("stealth", false, "Stealth mode: slower scan, random delays (bypass WAF/Cloudflare)")
 	delay := flag.Int("delay", 0, "Delay between requests in ms (0 = no delay)")
 	depth := flag.Int("depth", 3, "Crawl depth for endpoint discovery")
+	brute := flag.Bool("brute", false, "Enable DNS brute forcing with top 25 common subdomains")
 	flag.Parse()
 
 	// Stealth mode overrides
@@ -99,6 +109,14 @@ func main() {
 	// Always add the base domain
 	discoveredSubdomains[domain] = true
 	discoveredSubdomains["www."+domain] = true
+
+	// 1c: DNS brute forcing (optional)
+	if *brute {
+		fmt.Printf("   🔨 Brute forcing top 25 subdomains...\n")
+		for _, prefix := range Top25Subdomains {
+			discoveredSubdomains[prefix+"."+domain] = true
+		}
+	}
 
 	// Verify which subdomains are live
 	fmt.Printf("   Verifying %d potential subdomains...\n", len(discoveredSubdomains))
@@ -448,10 +466,10 @@ Usage:
 
 Examples:
   endpoint example.com                    # Full dynamic scan
+  endpoint example.com -brute             # Include DNS brute forcing
   endpoint example.com -stealth           # Stealth mode (slower, evades WAF)
   endpoint example.com -depth 5           # Deeper crawl
   endpoint example.com -o report.html     # Custom report name
-  endpoint example.com -serve             # Start web UI
 
 Options:
 `, version)
@@ -462,6 +480,12 @@ Discovery Methods:
   - DNS Records (MX, NS, TXT, CNAME)
   - Web crawling (HTML links, JavaScript API endpoints)
   - robots.txt and sitemap.xml parsing
+  - DNS brute forcing (-brute flag)
+
+Top 25 Brute Force Subdomains:
+  www, mail, api, admin, dev, staging, test, app, portal, secure,
+  vpn, remote, login, dashboard, cdn, static, assets, blog, shop,
+  support, docs, help, status, auth, token
 
 Compliance:
   Reports include OWASP Top 10, CWE, and NIST 800-53 mappings
