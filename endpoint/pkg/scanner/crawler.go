@@ -33,6 +33,7 @@ type Crawler struct {
 	RateLimit   time.Duration
 	baseDomain  string
 	client      *http.Client
+	closed      int32 // atomic flag to signal queue is closed
 }
 
 // NewCrawler creates a new crawler
@@ -55,8 +56,24 @@ func NewCrawler(workers int, timeout time.Duration) *Crawler {
 	}
 }
 
+// trySend safely sends to queue, returning false if crawler is closed
+func (c *Crawler) trySend(queue chan<- string, url string) bool {
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return false
+	}
+	select {
+	case queue <- url:
+		return true
+	default:
+		return false
+	}
+}
+
 // Crawl starts crawling from a base URL
 func (c *Crawler) Crawl(baseURL string) []CrawlResult {
+	// Reset closed flag
+	atomic.StoreInt32(&c.closed, 0)
+
 	// Parse base URL to get domain
 	parsed, err := url.Parse(baseURL)
 	if err != nil {
@@ -76,8 +93,12 @@ func (c *Crawler) Crawl(baseURL string) []CrawlResult {
 
 	// Also check common entry points
 	go func() {
-		c.checkRobotsTxt(baseURL, queue)
-		c.checkSitemap(baseURL, queue)
+		if atomic.LoadInt32(&c.closed) == 0 {
+			c.checkRobotsTxt(baseURL, queue)
+		}
+		if atomic.LoadInt32(&c.closed) == 0 {
+			c.checkSitemap(baseURL, queue)
+		}
 	}()
 
 	// Track active workers
@@ -126,8 +147,24 @@ func (c *Crawler) Crawl(baseURL string) []CrawlResult {
 		}
 	}
 
+	// Signal closed before closing channels to prevent panics
+	atomic.StoreInt32(&c.closed, 1)
 	close(done)
+
+	// Drain the queue before closing to prevent send-on-closed-channel
+	drainDone := make(chan struct{})
+	go func() {
+		for range queue {
+			// drain
+		}
+		close(drainDone)
+	}()
+
+	// Small delay to let workers exit their current iteration
+	time.Sleep(50 * time.Millisecond)
 	close(queue)
+	<-drainDone
+
 	wg.Wait()
 
 	return c.Results
@@ -181,15 +218,14 @@ func (c *Crawler) crawlPage(pageURL string, queue chan<- string) {
 	// Extract links
 	links := c.extractLinks(string(body), pageURL)
 	for _, link := range links {
+		if atomic.LoadInt32(&c.closed) == 1 {
+			return
+		}
 		c.mu.Lock()
 		if !c.visited[link] {
 			c.visited[link] = true
 			c.mu.Unlock()
-			select {
-			case queue <- link:
-			default:
-				// Queue full, skip
-			}
+			c.trySend(queue, link)
 		} else {
 			c.mu.Unlock()
 		}
@@ -205,14 +241,14 @@ func (c *Crawler) crawlPage(pageURL string, queue chan<- string) {
 	if strings.Contains(contentType, "javascript") || strings.Contains(string(body), "<script") {
 		apis := c.extractAPIEndpoints(string(body), pageURL)
 		for _, api := range apis {
+			if atomic.LoadInt32(&c.closed) == 1 {
+				return
+			}
 			c.mu.Lock()
 			if !c.visited[api] {
 				c.visited[api] = true
 				c.mu.Unlock()
-				select {
-				case queue <- api:
-				default:
-				}
+				c.trySend(queue, api)
 			} else {
 				c.mu.Unlock()
 			}
@@ -304,6 +340,9 @@ func (c *Crawler) checkRobotsTxt(baseURL string, queue chan<- string) {
 	// Extract paths from robots.txt
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
+		if atomic.LoadInt32(&c.closed) == 1 {
+			return
+		}
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Disallow:") || strings.HasPrefix(line, "Allow:") {
 			parts := strings.SplitN(line, ":", 2)
@@ -328,10 +367,7 @@ func (c *Crawler) checkRobotsTxt(baseURL string, queue chan<- string) {
 								c.OnResult(result)
 							}
 
-							select {
-							case queue <- fullURL:
-							default:
-							}
+							c.trySend(queue, fullURL)
 						} else {
 							c.mu.Unlock()
 						}
@@ -359,6 +395,10 @@ func (c *Crawler) checkSitemap(baseURL string, queue chan<- string) {
 
 // parseSitemap parses a sitemap XML
 func (c *Crawler) parseSitemap(sitemapURL string, queue chan<- string) {
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
+
 	resp, err := c.client.Get(sitemapURL)
 	if err != nil || resp.StatusCode != 200 {
 		return
@@ -372,6 +412,9 @@ func (c *Crawler) parseSitemap(sitemapURL string, queue chan<- string) {
 	matches := pattern.FindAllStringSubmatch(string(body), -1)
 
 	for _, match := range matches {
+		if atomic.LoadInt32(&c.closed) == 1 {
+			return
+		}
 		if len(match) > 1 {
 			pageURL := strings.TrimSpace(match[1])
 			if c.isSameDomain(pageURL) {
@@ -390,10 +433,7 @@ func (c *Crawler) parseSitemap(sitemapURL string, queue chan<- string) {
 						c.OnResult(result)
 					}
 
-					select {
-					case queue <- pageURL:
-					default:
-					}
+					c.trySend(queue, pageURL)
 				} else {
 					c.mu.Unlock()
 				}
