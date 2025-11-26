@@ -213,11 +213,85 @@ func main() {
 
 	fmt.Printf("   Found %d unique endpoints (%.1fs)\n", len(allEndpoints), time.Since(phaseStart).Seconds())
 
+	// Check for new subdomains discovered during crawling
+	if len(scanner.DiscoveredSubdomains) > 0 {
+		fmt.Printf("\n🔍 Phase 2b: Verifying subdomains found in content...\n")
+
+		// Track what we already have
+		existingHosts := make(map[string]bool)
+		for _, h := range liveHosts {
+			existingHosts[h] = true
+		}
+
+		newSubsToCheck := []string{}
+		checkedPrefixes := make(map[string]bool)
+
+		for sub := range scanner.DiscoveredSubdomains {
+			// Skip if we already have this exact subdomain
+			if existingHosts[sub] {
+				continue
+			}
+
+			// Extract subdomain prefix
+			prefix := strings.TrimSuffix(sub, "."+domain)
+			if prefix != sub && prefix != "" && !checkedPrefixes[prefix] {
+				checkedPrefixes[prefix] = true
+				newSubsToCheck = append(newSubsToCheck, prefix)
+			}
+		}
+
+		if len(newSubsToCheck) > 0 {
+			fmt.Printf("   Found %d new subdomain references, verifying...\n", len(newSubsToCheck))
+			newSubResults := subScanner.Scan(domain, newSubsToCheck)
+			for _, r := range newSubResults {
+				if r.Live && !existingHosts[r.Subdomain] {
+					existingHosts[r.Subdomain] = true
+					liveHosts = append(liveHosts, r.Subdomain)
+					fmt.Printf("   ✅ NEW: %s (%s)\n", r.Subdomain, r.IP)
+
+					scanReport.Subdomains = append(scanReport.Subdomains, report.SubdomainEntry{
+						Subdomain:  r.Subdomain,
+						IP:         r.IP,
+						StatusCode: r.StatusCode,
+						Scheme:     r.Scheme,
+					})
+
+					// Crawl the new subdomain too
+					baseURL := fmt.Sprintf("https://%s", r.Subdomain)
+					results := crawler.Crawl(baseURL)
+					for _, cr := range results {
+						if cr.StatusCode == 200 && allEndpoints[cr.URL].URL == "" {
+							allEndpoints[cr.URL] = cr
+							scanReport.Paths = append(scanReport.Paths, report.PathEntry{
+								URL:        cr.URL,
+								Path:       cr.URL,
+								StatusCode: cr.StatusCode,
+								Risk:       "INFO",
+								Category:   cr.Type,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// ==========================================
 	// PHASE 3: Port Scanning
 	// ==========================================
+	// Deduplicate hosts
+	uniqueHosts := make(map[string]bool)
+	dedupedHosts := []string{}
+	for _, h := range liveHosts {
+		if !uniqueHosts[h] {
+			uniqueHosts[h] = true
+			dedupedHosts = append(dedupedHosts, h)
+		}
+	}
+	liveHosts = dedupedHosts
+
 	ports := scanner.Top100Ports
-	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d ports per host)\n", len(ports))
+	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d hosts, %d ports each)\n", len(liveHosts), len(ports))
 	phaseStart = time.Now()
 
 	portScanner := scanner.NewPortScanner(*workers, timeoutDuration)

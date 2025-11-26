@@ -163,6 +163,14 @@ func (c *Crawler) crawlPage(pageURL string, queue chan<- string) {
 		}
 	}
 
+	// Extract subdomain references from content
+	foundSubs := c.ExtractSubdomains(string(body), c.baseDomain)
+	for _, sub := range foundSubs {
+		c.mu.Lock()
+		DiscoveredSubdomains[sub] = true
+		c.mu.Unlock()
+	}
+
 	// Extract API endpoints from JavaScript
 	if strings.Contains(contentType, "javascript") || strings.Contains(string(body), "<script") {
 		apis := c.extractAPIEndpoints(string(body), pageURL)
@@ -409,6 +417,45 @@ func (c *Crawler) isSameDomain(rawURL string) bool {
 	hostWithoutWWW := strings.TrimPrefix(host, "www.")
 	return hostWithoutWWW == baseWithoutWWW || strings.HasSuffix(hostWithoutWWW, "."+baseWithoutWWW)
 }
+
+// ExtractSubdomains finds subdomain references in crawled content
+func (c *Crawler) ExtractSubdomains(body, baseDomain string) []string {
+	subdomains := make(map[string]bool)
+
+	// Pattern to find subdomains of the target domain
+	escapedDomain := regexp.QuoteMeta(baseDomain)
+	pattern := regexp.MustCompile(`([a-zA-Z0-9][-a-zA-Z0-9]*\.)+` + escapedDomain)
+
+	matches := pattern.FindAllString(body, -1)
+	for _, match := range matches {
+		match = strings.ToLower(match)
+		if match != baseDomain && strings.HasSuffix(match, baseDomain) {
+			subdomains[match] = true
+		}
+	}
+
+	// Also look for subdomains in URLs
+	urlPattern := regexp.MustCompile(`https?://([a-zA-Z0-9][-a-zA-Z0-9]*\.)*` + escapedDomain)
+	urlMatches := urlPattern.FindAllString(body, -1)
+	for _, match := range urlMatches {
+		// Extract just the hostname
+		if u, err := url.Parse(match); err == nil {
+			host := strings.ToLower(u.Host)
+			if host != baseDomain && strings.HasSuffix(host, baseDomain) {
+				subdomains[host] = true
+			}
+		}
+	}
+
+	result := make([]string, 0, len(subdomains))
+	for sub := range subdomains {
+		result = append(result, sub)
+	}
+	return result
+}
+
+// DiscoveredSubdomains holds subdomains found during crawling
+var DiscoveredSubdomains = make(map[string]bool)
 
 // classifyURL determines the type of endpoint
 func (c *Crawler) classifyURL(rawURL, contentType string) string {
