@@ -248,3 +248,43 @@ func (de *DNSEnumerator) isSubdomain(host, domain string) bool {
 	domain = strings.ToLower(domain)
 	return strings.HasSuffix(host, "."+domain) || host == domain
 }
+
+// GetMXRecords returns MX records for a domain
+func (de *DNSEnumerator) GetMXRecords(domain string) []*net.MX {
+	records, err := net.LookupMX(domain)
+	if err != nil {
+		return nil
+	}
+	return records
+}
+
+// GetNSRecords returns NS records for a domain
+func (de *DNSEnumerator) GetNSRecords(domain string) []string {
+	records, err := net.LookupNS(domain)
+	if err != nil {
+		return nil
+	}
+	result := make([]string, 0, len(records))
+	for _, ns := range records {
+		result = append(result, strings.TrimSuffix(ns.Host, "."))
+	}
+	return result
+}
+
+// GetTXTRecords returns TXT records for a domain
+func (de *DNSEnumerator) GetTXTRecords(domain string) []string {
+	records, err := net.LookupTXT(domain)
+	if err != nil {
+		return nil
+	}
+	return records
+}
+
+// GetARecords returns A and AAAA records for a domain
+func (de *DNSEnumerator) GetARecords(domain string) []string {
+	ips, err := net.LookupHost(domain)
+	if err != nil {
+		return nil
+	}
+	return ips
+}

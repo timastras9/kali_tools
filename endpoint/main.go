@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -13,7 +14,7 @@ import (
 	"github.com/timastras9/kali_tools/endpoint/pkg/web"
 )
 
-const version = "3.1.0"
+const version = "3.2.0"
 
 // Top 25 most common subdomains for brute forcing
 var Top25Subdomains = []string{
@@ -103,6 +104,46 @@ func main() {
 		fmt.Printf("   ✅ DNS Records: Found %d subdomains\n", len(dnsSubs))
 		for _, sub := range dnsSubs {
 			discoveredSubdomains[sub] = true
+		}
+	}
+
+	// Show MX records (mail servers)
+	mxRecords := dnsEnum.GetMXRecords(domain)
+	if len(mxRecords) > 0 {
+		fmt.Println("   📧 MX Records (mail servers):")
+		for _, mx := range mxRecords {
+			fmt.Printf("      %s (priority %d)\n", mx.Host, mx.Pref)
+		}
+	}
+
+	// Show NS records (nameservers)
+	nsRecords := dnsEnum.GetNSRecords(domain)
+	if len(nsRecords) > 0 {
+		fmt.Println("   🌐 NS Records (nameservers):")
+		for _, ns := range nsRecords {
+			fmt.Printf("      %s\n", ns)
+		}
+	}
+
+	// Show TXT records (SPF, DKIM, etc.)
+	txtRecords := dnsEnum.GetTXTRecords(domain)
+	if len(txtRecords) > 0 {
+		fmt.Println("   📝 TXT Records:")
+		for _, txt := range txtRecords {
+			if len(txt) > 60 {
+				fmt.Printf("      %s...\n", txt[:60])
+			} else {
+				fmt.Printf("      %s\n", txt)
+			}
+		}
+	}
+
+	// Show A/AAAA records
+	aRecords := dnsEnum.GetARecords(domain)
+	if len(aRecords) > 0 {
+		fmt.Println("   🔢 A/AAAA Records:")
+		for _, ip := range aRecords {
+			fmt.Printf("      %s\n", ip)
 		}
 	}
 
@@ -297,19 +338,40 @@ func main() {
 	// ==========================================
 	// PHASE 3: Port Scanning
 	// ==========================================
-	// Deduplicate hosts
-	uniqueHosts := make(map[string]bool)
-	dedupedHosts := []string{}
+	// Deduplicate hosts by IP to avoid redundant scanning
+	ipToHost := make(map[string]string)    // IP -> first hostname with that IP
+	hostToIP := make(map[string]string)    // hostname -> IP (for reference)
+	hostsToScan := []string{}
+
 	for _, h := range liveHosts {
-		if !uniqueHosts[h] {
-			uniqueHosts[h] = true
-			dedupedHosts = append(dedupedHosts, h)
+		ips, err := net.LookupHost(h)
+		if err != nil || len(ips) == 0 {
+			continue
+		}
+		ip := ips[0]
+		hostToIP[h] = ip
+
+		if _, exists := ipToHost[ip]; !exists {
+			// First host with this IP - scan it
+			ipToHost[ip] = h
+			hostsToScan = append(hostsToScan, h)
 		}
 	}
-	liveHosts = dedupedHosts
+
+	// Show which hosts share IPs
+	if len(liveHosts) > len(hostsToScan) {
+		fmt.Printf("\n   ℹ️  Skipping redundant hosts (same IP):\n")
+		for _, h := range liveHosts {
+			ip := hostToIP[h]
+			primaryHost := ipToHost[ip]
+			if h != primaryHost {
+				fmt.Printf("      %s → same as %s (%s)\n", h, primaryHost, ip)
+			}
+		}
+	}
 
 	ports := scanner.Top100Ports
-	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d hosts, %d ports each)\n", len(liveHosts), len(ports))
+	fmt.Printf("\n🔌 Phase 3: Port Scanning (%d unique IPs, %d ports each)\n", len(hostsToScan), len(ports))
 	phaseStart = time.Now()
 
 	portScanner := scanner.NewPortScanner(*workers, timeoutDuration)
@@ -341,7 +403,7 @@ func main() {
 		}
 	}
 
-	portScanner.ScanMultipleHosts(liveHosts, ports)
+	portScanner.ScanMultipleHosts(hostsToScan, ports)
 	fmt.Printf("   Found %d open ports (%.1fs)\n", len(portScanner.Results), time.Since(phaseStart).Seconds())
 
 	// ==========================================
